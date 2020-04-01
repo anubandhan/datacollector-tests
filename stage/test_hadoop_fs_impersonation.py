@@ -35,8 +35,15 @@ def sdc_common_hook():
     return hook
 
 
+@pytest.fixture(autouse=True)
+def impersonation_check(sdc_executor):
+    if sdc_executor.sdc_configuration.get('stage.conf_hadoop.always.impersonate.current.user') != 'true':
+        pytest.skip('Hadoop FS impersonation requires stage.conf_hadoop.'
+                    'always.impersonate.current.user to be set to true')
+
+
 @cluster('cdh', 'hdp')
-def test_hadoop_fs_strict_impersonation(args, sdc_builder, sdc_executor, cluster):
+def test_hadoop_fs_strict_impersonation(sdc_builder, sdc_executor, cluster):
     """ Test strict impersonation (SDC-3704) of Hadoop FS target. The pipeline would look like:
 
         dev_data_generator >> hadoop_fs
@@ -51,6 +58,9 @@ def test_hadoop_fs_strict_impersonation(args, sdc_builder, sdc_executor, cluster
 
     dev_data_generator >> hadoop_fs
     pipeline = pipeline_builder.build(title='Hadoop FS impersonation pipeline').configure_for_environment(cluster)
+    # Some ENVs like HDP will auto-set this field which is against logic of this test and hence we have to manually
+    # reset that field back to empty value.
+    hadoop_fs.hdfs_user = ''
     sdc_executor.add_pipeline(pipeline)
 
     try:

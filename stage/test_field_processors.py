@@ -239,80 +239,6 @@ def test_field_hasher(sdc_builder, sdc_executor):
         assert new_value['sha512passcode'].value == passcode_sha512hash.hexdigest()
 
 
-def test_field_masker(sdc_builder, sdc_executor):
-    """Test field masker processor. The pipeline would look like:
-
-        dev_raw_data_source >> field_masker >> trash
-
-    With the given config below, `donKey` will be masked as `xxxxxxxxxx` (for fixed) and `xxxxxx` (for variable),
-    `617-567-8888` will be masked as `617-xxx-xxxx`, `94086-6161` will be masked as `940xx`, `30529 - 123-45-6789`
-    will be masked as `30529xxx123xxxxxxxx` (regex to mask all except groups 1 and 2).
-    """
-    raw_dict = dict(fixed_passwd='donKey', variable_passwd='donKey', custom_ph='617-567-8888',
-                    custom_zip='94086-6161', social='30529 - 123-45-6789')
-    raw_data = json.dumps(raw_dict)
-    field_mask_configs = [
-        {
-            'fields': ['/fixed_passwd'],
-            'maskType': 'FIXED_LENGTH',
-            'regex': '(.*)',
-            'groupsToShow': '1'
-        }, {
-            'fields': ['/variable_passwd'],
-            'maskType': 'VARIABLE_LENGTH',
-            'regex': '(.*)',
-            'groupsToShow': '1'
-        }, {
-            'fields': ['/custom_ph'],
-            'maskType': 'CUSTOM',
-            'regex': '(.*)',
-            'groupsToShow': '1',
-            'mask': '###-xxx-xxxx'
-        }, {
-            'fields': ['/custom_zip'],
-            'maskType': 'CUSTOM',
-            'regex': '(.*)',
-            'groupsToShow': '1',
-            'mask': '###xx'
-        }, {
-            'fields': ['/social'],
-            'maskType': 'REGEX',
-            'regex': '([0-9]{5}) - ([0-9]{3})-([0-9]{2})-([0-9]{4})',
-            'groupsToShow': '1,2'
-        }
-    ]
-
-    pipeline_builder = sdc_builder.get_pipeline_builder()
-    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
-    dev_raw_data_source.set_attributes(data_format='JSON', raw_data=raw_data)
-    field_masker = pipeline_builder.add_stage('Field Masker')
-    field_masker.set_attributes(field_mask_configs=field_mask_configs)
-    trash = pipeline_builder.add_stage('Trash')
-
-    dev_raw_data_source >> field_masker >> trash
-    pipeline = pipeline_builder.build('Field Masker pipeline')
-    sdc_executor.add_pipeline(pipeline)
-
-    snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
-    sdc_executor.stop_pipeline(pipeline)
-
-    new_value = snapshot[field_masker.instance_name].output[0].field
-    # assert fixed length mask always have the same masked characters
-    fixed_value = new_value['fixed_passwd'].value
-    assert fixed_value == len(fixed_value) * fixed_value[0]
-    # assert variable length mask always have the same masked characters with original length of the value
-    variable_value = new_value['variable_passwd'].value
-    assert variable_value == len(raw_dict['variable_passwd']) * variable_value[0]
-    # assert custom mask works
-    assert new_value['custom_ph'].value == '{}-xxx-xxxx'.format(raw_dict['custom_ph'][0:3])
-    # assert length of custom mask is the mask pattern length. Mask here is '###xx' and hence length of 5
-    custom_zip = new_value['custom_zip'].value
-    assert len(custom_zip) == 5 and custom_zip == '{}xx'.format(raw_dict['custom_zip'][0:3])
-    # assert regular expression mask
-    match = re.search('([0-9]{5}) - ([0-9]{3})-([0-9]{2})-([0-9]{4})', raw_dict['social'])
-    assert new_value['social'].value == '{}xxx{}xxxxxxxx'.format(match.group(1), match.group(2))
-
-
 def test_field_merger(sdc_builder, sdc_executor):
     """Test field merger processor. The pipeline would look like:
 
@@ -854,7 +780,7 @@ def test_field_type_converter_long_decimals(sdc_builder, sdc_executor):
 # SDC-11561: File Type Converter doesn't work properly with null in MAP and LIST types
 @sdc_min_version('3.9.0') # For the JavaScript processor use
 def test_field_type_converter_null_map(sdc_builder, sdc_executor):
-    """Make sure that the origin doesn't fail (does a no-op) on a map that is null."""
+    """Make sure that the processor doesn't fail (does a no-op) on a map that is null."""
     builder = sdc_builder.get_pipeline_builder()
 
     origin = builder.add_stage('Dev Raw Data Source')
@@ -863,7 +789,7 @@ def test_field_type_converter_null_map(sdc_builder, sdc_executor):
     origin.stop_after_first_batch = True
 
     javascript = builder.add_stage('JavaScript Evaluator')
-    javascript.script_record_type = 'SDC_RECORDS'
+    javascript.record_type = 'SDC_RECORDS'
     javascript.init_script = ''
     javascript.destroy_script = ''
     javascript.script =  """
@@ -900,6 +826,119 @@ def test_field_type_converter_null_map(sdc_builder, sdc_executor):
     history = sdc_executor.get_pipeline_history(pipeline)
     assert history.latest.metrics.counter('pipeline.batchInputRecords.counter').count == 1
     assert history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count == 1
+
+
+def test_field_type_converter_trim(sdc_builder, sdc_executor):
+    """Make sure that we properly trim if doing conversion from String to some of the other types."""
+    raw_data = json.dumps([{
+        'short': ' 123 ',
+        'long': ' 123 ',
+        'integer': ' 123 ',
+        'float': ' 123.5 ',
+        'double': ' 123.5 ',
+        'decimal': ' 123.5 ',
+        'zonedDatetime': ' 2011-12-03T10:15:30+01:00[Europe/Paris] ',
+        'datetime': ' 1978-01-05 19:38:01 ',
+        'time': '1978-01-05 19:38:01 ',
+        'date': ' 1978-01-05 19:38:01 ',
+        'boolean': ' true ',
+    }])
+
+    field_type_converter_configs = [
+        {
+            'fields': ['/short'],
+            'targetType': 'SHORT',
+        }, {
+            'fields': ['/long'],
+            'targetType': 'LONG',
+        }, {
+            'fields': ['/integer'],
+            'targetType': 'INTEGER'
+        }, {
+            'fields': ['/float'],
+            'targetType': 'FLOAT'
+        }, {
+            'fields': ['/double'],
+            'targetType': 'DOUBLE'
+        }, {
+            'fields': ['/decimal'],
+            'targetType': 'DECIMAL',
+            'scale': -1,
+            'decimalScaleRoundingStrategy': 'ROUND_UNNECESSARY'
+        }, {
+            'fields': ['/zonedDatetime'],
+            'targetType': 'ZONED_DATETIME'
+        }, {
+            'fields': ['/time'],
+            'targetType': 'TIME',
+            'dateFormat': 'YYYY_MM_DD_HH_MM_SS'
+        }, {
+            'fields': ['/datetime'],
+            'targetType': 'DATETIME',
+            'dateFormat': 'YYYY_MM_DD_HH_MM_SS'
+        }, {
+            'fields': ['/date'],
+            'targetType': 'DATE',
+            'dateFormat': 'YYYY_MM_DD_HH_MM_SS'
+        }, {
+            'fields': ['/boolean'],
+            'targetType': 'BOOLEAN'
+        }
+    ]
+
+    builder = sdc_builder.get_pipeline_builder()
+    source = builder.add_stage('Dev Raw Data Source')
+    source.data_format = 'JSON'
+    source.json_content = 'ARRAY_OBJECTS'
+    source.raw_data = raw_data
+    source.stop_after_first_batch = True
+
+    converter = builder.add_stage('Field Type Converter')
+    converter.conversion_method = 'BY_FIELD'
+    converter.field_type_converter_configs = field_type_converter_configs
+
+    trash = builder.add_stage('Trash')
+
+    source >> converter >> trash
+    pipeline = builder.build()
+    sdc_executor.add_pipeline(pipeline)
+
+    snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+
+    # Verify metadata (types)
+    output = snapshot[converter].output
+    assert output[0].field['short'].type == 'SHORT'
+    assert output[0].field['short'].value == 123
+
+    assert output[0].field['long'].type == 'LONG'
+    assert output[0].field['long'].value == 123
+
+    assert output[0].field['integer'].type == 'INTEGER'
+    assert output[0].field['integer'].value == 123
+
+    assert output[0].field['float'].type == 'FLOAT'
+    assert output[0].field['float'].value == 123.5
+
+    assert output[0].field['double'].type == 'DOUBLE'
+    assert output[0].field['double'].value == 123.5
+
+    assert output[0].field['decimal'].type == 'DECIMAL'
+    assert output[0].field['decimal'].value == 123.5
+
+    assert output[0].field['zonedDatetime'].type == 'ZONED_DATETIME'
+    assert output[0].field['zonedDatetime'].value == '2011-12-03T10:15:30+01:00[Europe/Paris]'
+
+    assert output[0].field['datetime'].type == 'DATETIME'
+    assert output[0].field['datetime'].value == datetime(1978, 1, 5, 19, 38, 1)
+
+    assert output[0].field['time'].type == 'TIME'
+    assert output[0].field['time'].value == datetime(1978, 1, 5, 19, 38, 1)
+
+    assert output[0].field['date'].type == 'DATE'
+    assert output[0].field['date'].value == datetime(1978, 1, 5, 19, 38, 1)
+
+    assert output[0].field['boolean'].type == 'BOOLEAN'
+    assert output[0].field['boolean'].value == True
 
 
 def test_field_zip(sdc_builder, sdc_executor):

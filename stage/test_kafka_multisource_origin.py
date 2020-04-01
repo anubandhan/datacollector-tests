@@ -45,6 +45,41 @@ def sdc_common_hook():
 
 
 @cluster('cdh', 'kafka')
+@sdc_min_version('3.15.0')
+def test_kafka_origin_including_timestamps(sdc_builder, sdc_executor, cluster):
+    """Check that timestamp and timestamp type are included in record header. Verifies that for previous versions of
+    kafka (< 0.10), a validation issue is thrown.
+
+    Kafka Consumer Origin pipeline with standalone mode:
+        kafka_consumer >> trash
+    """
+    stage_libs = cluster.sdc_stage_libs
+
+    message = 'Hello World from SDC & DPM!'
+    expected = '{\'text\': Hello World from SDC & DPM!}'
+
+    # Build the Kafka consumer pipeline with Standalone mode.
+    builder = sdc_builder.get_pipeline_builder()
+    kafka_multitopic_consumer = get_kafka_multitopic_consumer_stage(builder, cluster)
+    kafka_multitopic_consumer.set_attributes(include_timestamps=True)
+
+    trash = builder.add_stage(label='Trash')
+    kafka_multitopic_consumer >> trash
+    kafka_consumer_pipeline = builder.build().configure_for_environment(cluster)
+    kafka_consumer_pipeline.configuration['shouldRetry'] = False
+    kafka_consumer_pipeline.configuration['executionMode'] = 'STANDALONE'
+
+    sdc_executor.add_pipeline(kafka_consumer_pipeline)
+
+    try:
+        # Publish messages to Kafka and verify using snapshot if the same messages are received.
+        produce_kafka_messages(kafka_multitopic_consumer.topic_list[0], cluster, message.encode(), 'TEXT')
+        verify_kafka_origin_results(kafka_consumer_pipeline, sdc_executor, expected, 'TEXT_TIMESTAMP')
+    finally:
+        sdc_executor.stop_pipeline(kafka_consumer_pipeline)
+
+
+@cluster('cdh', 'kafka')
 @sdc_min_version('3.6.0')
 def test_kafka_origin_timestamp_offset_strategy(sdc_builder, sdc_executor, cluster):
     """Check that accessing a topic for first time using TIMESTAMP offset strategy retrieves messages
@@ -85,7 +120,7 @@ def test_kafka_origin_timestamp_offset_strategy(sdc_builder, sdc_executor, clust
     try:
         # Publish messages to Kafka and verify using snapshot if the same messages are received.
 
-        verify_kafka_origin_results_timestamp(kafka_consumer_pipeline, sdc_executor, expected, 'TEXT')
+        verify_kafka_origin_results(kafka_consumer_pipeline, sdc_executor, expected, 'TEXT')
     finally:
         sdc_executor.stop_pipeline(kafka_consumer_pipeline)
 
@@ -156,6 +191,61 @@ def test_kafka_origin_not_saving_offset(sdc_builder, sdc_executor, cluster):
         sdc_executor.stop_pipeline(pipeline)
 
 
+@cluster('cdh', 'kafka')
+def test_kafka_origin_save_offset(sdc_builder, sdc_executor, cluster):
+    """ Above SDC-10501 introduced a bug which does not commit offset when the number of records
+    is less than the max batch size. This process 5 records for the 1st run, stop pipeline, and
+    run again to process 3 records for the 2nd run. 2nd run should process 3 records as the offset
+    should be saved after the 1st run.
+
+    Kafka Multitopic Origin >> Trash (Run twice)
+    """
+    topic = get_random_string(string.ascii_letters, 10)
+
+    builder = sdc_builder.get_pipeline_builder()
+
+    kafka_multitopic_consumer = get_kafka_multitopic_consumer_stage(builder, cluster)
+    kafka_multitopic_consumer.topic_list = [topic]
+    kafka_multitopic_consumer.auto_offset_reset = 'EARLIEST'
+    kafka_multitopic_consumer.consumer_group = get_random_string(string.ascii_letters, 10)
+    kafka_multitopic_consumer.batch_wait_time_in_ms = 100
+
+    trash = builder.add_stage(label='Trash')
+
+    kafka_multitopic_consumer >> trash
+
+    pipeline = builder.build().configure_for_environment(cluster)
+    pipeline.configuration['shouldRetry'] = False
+    pipeline.configuration['executionMode'] = 'STANDALONE'
+
+    sdc_executor.add_pipeline(pipeline)
+
+    # Produce 5 messages
+    messages = [f'message{i}' for i in range(0, 5)]
+    produce_kafka_messages_list(kafka_multitopic_consumer.topic_list[0], cluster, messages, 'TEXT')
+
+    try:
+        # Start the pipeline, read one batch and stop.
+        snapshot1 = sdc_executor.capture_snapshot(pipeline, batches=1, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+        # Check if the pipeline processed 5 records
+        records = snapshot1[kafka_multitopic_consumer].output
+        assert len(records) == 5
+
+        # Produce another 3 messages
+        messages2 = [f'message{i}' for i in range(5, 8)]
+        produce_kafka_messages_list(kafka_multitopic_consumer.topic_list[0], cluster, messages2, 'TEXT')
+
+        # Run the pipeline second time
+        snapshot2 = sdc_executor.capture_snapshot(pipeline, batches=1, start_pipeline=True).snapshot
+        #  2nd run should processed only 3 records
+        records2 = snapshot2[kafka_multitopic_consumer].output
+        assert len(records2) == 3
+
+    finally:
+        sdc_executor.stop_pipeline(pipeline)
+
+
 # SDC-10897: Kafka setting for Batch Wait Time and Max Batch Size not working in conjunction
 @cluster('cdh', 'kafka')
 @sdc_min_version('3.6.0')
@@ -217,7 +307,7 @@ def test_kafka_origin_batch_max_size(sdc_builder, sdc_executor, cluster):
 
 # SDC-10897: Kafka setting for Batch Wait Time and Max Batch Size not working in conjunction
 @cluster('cdh', 'kafka')
-@sdc_min_version('3.6.0')
+@sdc_min_version('3.9.1')
 def test_kafka_origin_batch_max_wait_time(sdc_builder, sdc_executor, cluster):
     """Check that retrieving messages from Kafka using Kafka Multitopic Consumer respects both the Batch Max Wait Time
     and the Max Batch Size. Batches are sent when the first of the two conditions is met. This test is checking that
@@ -283,7 +373,7 @@ def test_kafka_origin_batch_max_wait_time(sdc_builder, sdc_executor, cluster):
         start_kafka_pipeline_command = sdc_executor.start_pipeline(kafka_consumer_pipeline)
 
         start = time.time()
-        start_kafka_pipeline_command.wait_for_pipeline_batch_count(20)
+        start_kafka_pipeline_command.wait_for_pipeline_output_records_count(20)
         end = time.time()
         total_time = (end - start)
         assert total_time < 5.0
@@ -306,6 +396,40 @@ def test_kafka_origin_batch_max_wait_time(sdc_builder, sdc_executor, cluster):
         status = sdc_executor.get_pipeline_status(rpc_origin_pipeline).response.json().get('status')
         if status != 'STOPPED':
             sdc_executor.stop_pipeline(rpc_origin_pipeline)
+
+
+# SDC-13819: Kafka Multi-Topic Consumer refuses to ingest malformed records, rather than sending them to pipeline error handling
+@cluster('cdh', 'kafka')
+@sdc_min_version('3.15.0')
+def test_kafka_origin_only_errors(sdc_builder, sdc_executor, cluster):
+    """
+    Ensure that the origin can read batches with only error records. We accomplish that by configuring JSON as a file
+    format and pushing messages that are clearly not JSON.
+    """
+    builder = sdc_builder.get_pipeline_builder()
+    origin = get_kafka_multitopic_consumer_stage(builder, cluster)
+    # We explicitly read files as JSON
+    origin.data_format = 'JSON'
+
+    trash = builder.add_stage(label='Trash')
+    origin >> trash
+
+    pipeline = builder.build().configure_for_environment(cluster)
+    pipeline.configuration['shouldRetry'] = False
+    pipeline.configuration['executionMode'] = 'STANDALONE'
+
+    sdc_executor.add_pipeline(pipeline)
+    try:
+        # Produce three text messages (e.g. no JSON)
+        produce_kafka_messages_list(origin.topic_list[0], cluster, ["A", "B", "C"], 'TEXT')
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+
+        # No normal records should be read
+        assert len(snapshot[origin].output) == 0
+        # But we should see the 3 errors
+        assert len(snapshot[origin].error_records) == 3
+    finally:
+        sdc_executor.stop_pipeline(pipeline)
 
 
 def get_kafka_multitopic_consumer_stage(pipeline_builder, cluster):
@@ -384,7 +508,7 @@ def produce_kafka_messages_in_different_timestamp(topic, cluster, messages, data
     return timestamp
 
 
-def verify_kafka_origin_results_timestamp(kafka_multitopic_consumer_pipeline, sdc_executor, message, data_format):
+def verify_kafka_origin_results(kafka_multitopic_consumer_pipeline, sdc_executor, message, data_format):
     """Start, stop pipeline and verify results using snapshot"""
 
     # Start Pipeline.
@@ -402,3 +526,12 @@ def verify_kafka_origin_results_timestamp(kafka_multitopic_consumer_pipeline, sd
     if data_format in basic_data_formats:
         record_field = [record.field for record in snapshot[kafka_multitopic_consumer_pipeline[0].instance_name].output]
         assert message == [str(record_field[0]), str(record_field[1])]
+
+    elif data_format == 'TEXT_TIMESTAMP':
+        record_field = [record.field for record in snapshot[kafka_multitopic_consumer_pipeline[0].instance_name].output]
+        record_header = [record.header for record in snapshot[kafka_multitopic_consumer_pipeline[0].instance_name].output]
+        for element in record_header:
+            logger.debug('ELEMENT: %s', element['values'])
+            assert 'timestamp' in element['values']
+            assert 'timestampType' in element['values']
+        assert message == str(record_field[0])

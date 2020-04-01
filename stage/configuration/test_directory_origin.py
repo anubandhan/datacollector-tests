@@ -22,9 +22,11 @@ import time
 from collections import OrderedDict
 
 import pytest
+from streamsets.sdk.utils import Version
 from streamsets.sdk.sdc_api import StartError
 from streamsets.testframework.markers import sdc_min_version
 from streamsets.testframework.utils import get_random_string
+from stage.utils.utils_xml import get_xml_output_field
 from xml.etree import ElementTree
 
 logger = logging.getLogger(__file__)
@@ -241,7 +243,8 @@ def test_directory_origin_configuration_batch_size_in_recs(sdc_builder, sdc_exec
     FILE_CONTENTS_1 = get_text_file_content('1')
     FILE_CONTENTS_2 = get_text_file_content('2')
     number_of_batches = math.ceil(3 / batch_size_in_recs) + math.ceil(3 / batch_size_in_recs)
-
+    if batch_size_in_recs == 3:
+        number_of_batches = 3
     try:
         logger.debug('Creating files directory %s ...', files_directory)
         shell_executor(f'mkdir {files_directory}')
@@ -343,7 +346,8 @@ def test_directory_origin_configuration_comment_marker(sdc_builder, sdc_executor
 @pytest.mark.parametrize('compression_format', ['COMPRESSED_FILE'])
 @pytest.mark.parametrize('compression_codec', ['GZIP', 'BZIP2'])
 def test_directory_origin_configuration_compression_format(sdc_builder, sdc_executor, data_format, compression_format,
-                                                           compressed_file_writer, compression_codec, shell_executor):
+                                                           compressed_file_writer, compression_codec, shell_executor,
+                                                           keep_data):
     """Verify direcotry origin can read data from compressed files.
         Pattern is inside the compressed file.
         e.g. compression_format_test.txt is compressed as compression_format_test.txt.gz then
@@ -365,8 +369,8 @@ def test_directory_origin_configuration_compression_format(sdc_builder, sdc_exec
             file_content = ''.join(json.dumps(record) for record in file_content)
 
         # Writes compressed file to local FS.
-        compressed_file_writer(tmp_directory, data_format, compression_format, file_content,
-                               compression_codec=compression_codec, files_prefix='sdc-${sdc:id()}')
+        compressed_file_writer(tmp_directory, data_format, file_content, compression_codec=compression_codec,
+                               files_prefix='sdc-${sdc:id()}')
         # Reading from compressed file.
         attributes = {'data_format': data_format,
                       'file_name_pattern': 'sdc*',
@@ -381,8 +385,10 @@ def test_directory_origin_configuration_compression_format(sdc_builder, sdc_exec
         execute_pipeline_and_verify_output(sdc_executor, directory, pipeline, data_format,
                                            actual_file_content, actual_file_content)
     finally:
-        sdc_executor.stop_pipeline(pipeline)
-        shell_executor(f'rm -r {tmp_directory}')
+        if sdc_executor.get_pipeline_status(pipeline).response.json().get('status') == 'RUNNING':
+            sdc_executor.stop_pipeline(pipeline)
+        if not keep_data:
+            shell_executor(f'rm -r {tmp_directory}')
 
 
 @pytest.mark.parametrize('data_format', ['DATAGRAM'])
@@ -441,7 +447,7 @@ def test_directory_origin_configuration_data_format(sdc_builder, sdc_executor, d
     file_content = ''.join(json.dumps(record) for record in json_data)
 
     try:
-        compressed_file_writer(files_directory, data_format, 'NONE', file_content, 'NONE')
+        compressed_file_writer(files_directory, data_format, file_content, 'NONE')
 
         attributes = {'data_format': data_format,
                       'file_name_pattern': '*.json',
@@ -543,7 +549,7 @@ def test_directory_origin_configuration_delimiter_element(sdc_builder, sdc_execu
                               <request>GET /images/sponsored.gif 304</request>
                           </msg>
                       </root>"""
-
+    EXPECTED_OUTPUT = {'time': [{'value': '8/12/2016 6:01:00'}], 'request': [{'value': 'GET /index.html 200'}]}
     try:
         logger.debug('Creating files directory %s ...', files_directory)
         shell_executor(f'mkdir {files_directory}')
@@ -555,22 +561,17 @@ def test_directory_origin_configuration_delimiter_element(sdc_builder, sdc_execu
                                  files_directory=files_directory,
                                  file_name_pattern='xml_delimited_file*',
                                  file_name_pattern_mode='GLOB',
-                                 delimeter_element='msg')
+                                 delimiter_element='msg')
         trash = pipeline_builder.add_stage('Trash')
         directory >> trash
         pipeline = pipeline_builder.build()
 
         sdc_executor.add_pipeline(pipeline)
         snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True, batch_size=3).snapshot
-        output_records = snapshot[directory.instance_name].output
-        item_list = output_records[0].field['msg']
-        rows_from_snapshot = [{item['time'][0]['value'].value: item['request'][0]['value'].value}
-                              for item in item_list]
-        # Parse input xml data to verify results from snapshot.
-        root = ElementTree.fromstring(FILE_CONTENTS)
-        expected_data = [{msg.find('time').text: msg.find('request').text}
-                         for msg in root.iter('msg')]
-        assert rows_from_snapshot == expected_data
+        output_data = snapshot[directory.instance_name].output[0].field
+        output_records = get_xml_output_field(directory, output_data, 'msg')
+        assert output_records == EXPECTED_OUTPUT
+
     finally:
         sdc_executor.stop_pipeline(pipeline)
         shell_executor(f'rm -r {files_directory}')
@@ -737,13 +738,48 @@ def test_directory_origin_configuration_exclude_interval(sdc_builder, sdc_execut
     pass
 
 
-@pytest.mark.parametrize('data_format', ['DELIMITED'])
-@pytest.mark.parametrize('allow_extra_columns', [True])
-@pytest.mark.parametrize('header_line', ['WITH_HEADER'])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_extra_column_prefix(sdc_builder, sdc_executor,
-                                                            data_format, allow_extra_columns, header_line):
-    pass
+@pytest.mark.parametrize('extra_column_prefix', ['', '_extra_'])
+@pytest.mark.parametrize('stage_attributes', [{'allow_extra_columns': True,
+                                               'data_format': 'DELIMITED',
+                                               'header_line': 'WITH_HEADER'}])
+def test_extra_column_prefix(sdc_builder, sdc_executor, stage_attributes, keep_data,
+                             extra_column_prefix, shell_executor, file_writer):
+    """Test the Extra Column Prefix configuration when extra columns are seen in records.
+
+    In this test case, 3 comma-delimited lines are processed. The first, a header line, defines 3 fields.
+    The next has 5 fields and the last has 3 fields. The extra column prefix should be seen in the additional
+    lines in line two and nowhere else.
+    """
+    files_directory = os.path.join('/tmp', get_random_string())
+    FILE_NAME = 'file.csv'
+    DATA = [['c1', 'c2', 'c3'], ['f11', 'f12', 'f13', 'f14'],
+            ['f21', 'f22', 'f23']]
+    EXPECTED_OUTPUT = [{'c1': 'f11', 'c2': 'f12', 'c3': 'f13', f'{extra_column_prefix}01': 'f14'},
+                       {'c1': 'f21', 'c2': 'f22', 'c3': 'f23'}]
+
+    file_content = '\n'.join(','.join(line) for line in DATA)
+    try:
+        shell_executor(f'mkdir {files_directory}')
+        file_writer(os.path.join(files_directory, FILE_NAME), '\n'.join(','.join(line) for line in DATA))
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        directory = pipeline_builder.add_stage('Directory').set_attributes(extra_column_prefix=extra_column_prefix,
+                                                                           files_directory=files_directory,
+                                                                           file_name_pattern=FILE_NAME,
+                                                                           **stage_attributes)
+        trash = pipeline_builder.add_stage('Trash')
+        pipeline_finisher = pipeline_builder.add_stage('Pipeline Finisher Executor')
+        directory >> [trash, pipeline_finisher]
+        pipeline = pipeline_builder.build()
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        records = [record.field for record in snapshot[directory].output]
+
+        assert records == EXPECTED_OUTPUT
+    finally:
+        if not keep_data:
+            shell_executor(f'rm -r {files_directory}')
 
 
 @pytest.mark.parametrize('data_format', ['LOG'])
@@ -855,17 +891,15 @@ def test_directory_origin_configuration_file_name_pattern_within_compressed_dire
         json_data = None
         if data_format == 'DELIMITED':
             files_directory = create_file_and_directory(file_name, file_content, shell_executor,
-                                                                          delimited_file_writer, 'CSV')
+                                                        delimited_file_writer, 'CSV')
         elif data_format == 'SDC_JSON':
             files_directory = os.path.join('/tmp', get_random_string())
             file_name = file_name.replace('.json', '*.json')
-            json_data = file_content # Used in assertion
+            json_data = file_content  # Used in assertion
             file_content = ''.join(json.dumps(record) for record in file_content)
-            compressed_file_writer(files_directory, data_format, 'NONE', file_content, 'NONE',
-                                   'compression_format_test')
+            compressed_file_writer(files_directory, data_format, file_content, 'NONE', 'compression_format_test')
         else:
-            files_directory = create_file_and_directory(file_name, file_content, shell_executor,
-                                                                          file_writer)
+            files_directory = create_file_and_directory(file_name, file_content, shell_executor, file_writer)
 
         if compression_format == 'ARCHIVE':
             shell_executor(f'cd {files_directory} '
@@ -878,12 +912,12 @@ def test_directory_origin_configuration_file_name_pattern_within_compressed_dire
                            f'&& rm {file_name}')
             file_name_pattern = '*.gz'
 
-        attributes = {'data_format':data_format,
-                      'files_directory':files_directory,
-                      'file_name_pattern_within_compressed_directory':'compression_*',
-                      'file_name_pattern':file_name_pattern,
+        attributes = {'data_format': data_format,
+                      'files_directory': files_directory,
+                      'file_name_pattern_within_compressed_directory': 'compression_*',
+                      'file_name_pattern': file_name_pattern,
                       'file_name_pattern_mode': 'GLOB',
-                      'compression_format':compression_format,
+                      'compression_format': compression_format,
                       'header_line': 'WITH_HEADER',
                       'log_format': 'LOG4J',
                       'json_content': 'MULTIPLE_OBJECTS'}
@@ -945,18 +979,95 @@ def test_directory_origin_configuration_first_file_to_process(sdc_builder, sdc_e
             sdc_executor.stop_pipeline(pipeline)
 
 
-@pytest.mark.parametrize('data_format', ['LOG'])
-@pytest.mark.parametrize('log_format', ['GROK'])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_grok_pattern(sdc_builder, sdc_executor, data_format, log_format):
-    pass
+@pytest.mark.parametrize('grok_pattern_is_correct', [True, False])
+@pytest.mark.parametrize('stage_attributes', [{'data_format': 'LOG', 'log_format': 'GROK'}])
+def test_grok_pattern(sdc_builder, sdc_executor, stage_attributes, grok_pattern_is_correct,
+                      file_writer, shell_executor, keep_data):
+    """Test for the grok pattern configuration that is used to parse the log line.
+
+    For the positive case, we rely upon the field's default value of '%{COMMONAPACHELOG}' and then
+    ensure that changing this has the intended effect of breaking things for the negative case.
+    """
+    files_directory = os.path.join('/tmp', get_random_string())
+    FILE_NAME = 'b.txt'
+    DATA = '127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /apache.gif HTTP/1.0" 200 232'
+    EXPECTED_OUTPUT = {'request': '/apache.gif', 'auth': 'frank', 'ident': '-', 'response': '200', 'bytes':
+                       '232', 'clientip': '127.0.0.1', 'verb': 'GET', 'httpversion': '1.0', 'rawrequest': None,
+                       'timestamp': '10/Oct/2000:13:55:36 -0700'}
+    try:
+        shell_executor(f'mkdir {files_directory}')
+        file_writer(os.path.join(files_directory, FILE_NAME), DATA)
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        directory = pipeline_builder.add_stage('Directory').set_attributes(files_directory=files_directory,
+                                                                           file_name_pattern='*.txt',
+                                                                           **stage_attributes)
+        if not grok_pattern_is_correct:
+            # We use '%{HOST}', a valid grok pattern, as this will ensure that we don't trigger exceptions
+            # but simply break matching.
+            directory.grok_pattern = '%{HOST}'
+        trash = pipeline_builder.add_stage('Trash')
+        pipeline_finisher = pipeline_builder.add_stage('Pipeline Finisher Executor')
+        directory >> [trash, pipeline_finisher]
+        pipeline = pipeline_builder.build()
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        records = [record.field for record in snapshot[directory].output]
+        error_records = [record.field for record in snapshot[directory].error_records]
+        if grok_pattern_is_correct:
+            assert records == [EXPECTED_OUTPUT]
+        else:
+            # If grok pattern doesn't match the input, no records should go through and there should be stage errors
+            # raised.
+            assert not records and sdc_executor.get_stage_errors(pipeline, directory)
+    finally:
+        if not keep_data:
+            shell_executor(f'rm -r {files_directory}')
 
 
-@pytest.mark.parametrize('data_format', ['LOG'])
-@pytest.mark.parametrize('log_format', ['GROK'])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_grok_pattern_definition(sdc_builder, sdc_executor, data_format, log_format):
-    pass
+@pytest.mark.parametrize('grok_pattern_definition', ['MY_CUSTOM_LOG_1', 'MY_CUSTOM_LOG_2'])
+@pytest.mark.parametrize('stage_attributes', [{'data_format': 'LOG', 'log_format': 'GROK'}])
+def test_grok_pattern_definition(sdc_builder, sdc_executor, stage_attributes, shell_executor, file_writer,
+                                 grok_pattern_definition, keep_data):
+    """Test whether Directory origin can parse logs using a couple of different grok pattern definitions."""
+    files_directory = os.path.join('/tmp', get_random_string())
+    FILE_NAME = 'b.txt'
+    FILE_CONTENT = ('127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /apache.gif HTTP/1.0" 200 2326 '
+                    '"http://www.example.com/strt.html"')
+
+    if grok_pattern_definition == 'MY_CUSTOM_LOG_1':
+        GROK_PATTERN_DEFINITION = 'MYCUSTOMLOG %{COMMONAPACHELOG} %{QS:referrer}'
+        EXPECTED_OUTPUT = {'request': '/apache.gif', 'auth': 'frank', 'ident': '-', 'verb': 'GET',
+                           'referrer': '"http://www.example.com/strt.html"', 'response': '200', 'bytes': '2326',
+                           'clientip': '127.0.0.1', 'httpversion': '1.0', 'rawrequest': None,
+                           'timestamp': '10/Oct/2000:13:55:36 -0700'}
+    else:
+        GROK_PATTERN_DEFINITION = r'MYCUSTOMLOG \[%{HTTPDATE:timestamp}\]'
+        EXPECTED_OUTPUT = {'timestamp': '10/Oct/2000:13:55:36 -0700'}
+
+    try:
+        shell_executor(f'mkdir {files_directory}')
+        file_writer(os.path.join(files_directory, FILE_NAME), FILE_CONTENT)
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        directory = pipeline_builder.add_stage('Directory')
+        directory.set_attributes(files_directory=files_directory,
+                                 file_name_pattern='*.txt',
+                                 grok_pattern='%{MYCUSTOMLOG}',
+                                 grok_pattern_definition=GROK_PATTERN_DEFINITION,
+                                 **stage_attributes)
+        trash = pipeline_builder.add_stage('Trash')
+        pipeline_finisher = pipeline_builder.add_stage('Pipeline Finisher Executor')
+        directory >> [trash, pipeline_finisher]
+        pipeline = pipeline_builder.build()
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        records = [record.field for record in snapshot[directory].output]
+        assert records == [EXPECTED_OUTPUT]
+    finally:
+        if not keep_data:
+            shell_executor(f'rm -r {files_directory}')
 
 
 @pytest.mark.parametrize('data_format', ['DELIMITED'])
@@ -1026,19 +1137,54 @@ def test_directory_origin_configuration_ignore_control_characters_delimited(sdc_
             assert output_records[0].field == OrderedDict([('field1', 'Field\x00 11'), ('field2', 'Field\v12'),
                                                            ('field3', 'Fie\fld\a13')])
     finally:
-        shell_executor(f'rm -r {files_directory}')
+        #shell_executor(f'rm -r {files_directory}')
         sdc_executor.stop_pipeline(pipeline)
 
 
-@pytest.mark.parametrize('ignore_control_characters', [True, False])
-@pytest.mark.skip('Not yet implemented')
+@pytest.mark.parametrize('stage_attributes', [{'ignore_control_characters': True},
+                                              {'ignore_control_characters': False}])
 def test_directory_origin_configuration_ignore_control_characters_json(sdc_builder, sdc_executor,
-                                                                       ignore_control_characters, shell_executor,
-                                                                       file_writer):
-    """Directory origin not able to read json data with control characters.
-    Filed bug :- https://issues.streamsets.com/browse/SDC-11604.
-    """
-    pass
+                                                                       stage_attributes, keep_data,
+                                                                       shell_executor, file_writer):
+    """Test for the Ignore Control Characters configuration when parsing JSON."""
+    files_directory = os.path.join('/tmp', get_random_string())
+    FILE_NAME = 'a.json'
+    # We have to give a string of JSON data instead of using something like json.dumps on a dictionary because
+    # the json library would always escape the very control characters we're trying to test (ECMA-404).
+    DATA = '{"line": "This was some text with control char\vacters."}'
+    EXPECTED_OUTPUT = {'line': 'This was some text with control characters.'}
+
+    try:
+        shell_executor(f'mkdir {files_directory}')
+        file_writer(os.path.join(files_directory, FILE_NAME), DATA)
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        directory = pipeline_builder.add_stage('Directory').set_attributes(data_format='JSON',
+                                                                           files_directory=files_directory,
+                                                                           file_name_pattern='*.json',
+                                                                           batch_size_in_recs=10,
+                                                                           **stage_attributes)
+        trash = pipeline_builder.add_stage('Trash')
+        pipeline_finisher = pipeline_builder.add_stage('Pipeline Finisher Executor')
+        directory >> [trash, pipeline_finisher]
+        pipeline = pipeline_builder.build()
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        records = [record.field for record in snapshot[directory].output]
+        if stage_attributes['ignore_control_characters']:
+            assert records == [EXPECTED_OUTPUT]
+        else:
+            # If we don't ignore control characters, SPOOLDIR_01 is raised because the file cannot be parsed by the
+            # Directory origin and no records are output.
+            assert sdc_executor.get_stage_errors(pipeline, directory)[0].error_code == 'SPOOLDIR_01' and not records
+    finally:
+        if not keep_data:
+            shell_executor(f'rm -r {files_directory}')
+        # When Ignore Control Characters == False, a stage error means no batches are output, so the Pipeline Finisher
+        # isn't triggered, meaning we need to stop the pipeline ourselves.
+        if sdc_executor.get_pipeline_status(pipeline).response.json().get('status') == 'RUNNING':
+            sdc_executor.stop_pipeline(pipeline)
 
 
 @pytest.mark.parametrize('ignore_control_characters', [True, False])
@@ -1136,17 +1282,19 @@ def test_directory_origin_configuration_include_field_xpaths(sdc_builder, sdc_ex
                         </bookstore>"""
     try:
         files_directory = create_file_and_directory(FILE_NAME, FILE_CONTENTS, shell_executor,file_writer)
-        attributes= {'data_format':data_format,
-                                 'files_directory':files_directory,
-                                 'file_name_pattern':'xml_include_xpath_file*',
-                                 'file_name_pattern_mode':'GLOB',
-                                 'delimiter_element':'/*[1]/*',
-                                 'include_field_xpaths':include_field_xpaths}
+        attributes = {'data_format': data_format,
+                      'files_directory': files_directory,
+                      'file_name_pattern': 'xml_include_xpath_file*',
+                      'file_name_pattern_mode': 'GLOB',
+                      'delimiter_element': '/*[1]/*',
+                      'include_field_xpaths': include_field_xpaths}
         directory, pipeline = get_directory_to_trash_pipeline(sdc_builder, attributes)
 
         sdc_executor.add_pipeline(pipeline)
         snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True, batch_size=3).snapshot
-        item_list = [output.field for output in snapshot[directory.instance_name].output]
+
+        item_list = [get_xml_output_field(directory, output.field, 'b:book')
+                     for output in snapshot[directory.instance_name].output]
         rows_from_snapshot = [{item['title'][0]['value'].value: item['prc:price'][0]['value'].value}
                               for item in item_list]
         # Parse input xml data to verify results from snapshot using xpath for search.
@@ -1156,13 +1304,15 @@ def test_directory_origin_configuration_include_field_xpaths(sdc_builder, sdc_ex
         assert rows_from_snapshot == expected_data
         output_records = snapshot[directory.instance_name].output
 
+        output_data = output_records[0]._data['value']['value']
+        field_info = get_xml_output_field(directory, output_data, 'b:book', 'value')
+
         if include_field_xpaths:
             # Test for Record Headers
             record_header = [record.header.values for record in output_records]
             assert record_header[0]['xmlns:b'] == 'http://books.com/book'
             assert record_header[0]['xmlns:prc'] == 'http://books.com/price'
             # Test for Field Headers .Currently using _data property since api for field header is not there.
-            field_info = output_records[0]._data['value']['value']
             assert (field_info['title']['value'][0]['value']['attr|lang']['attributes'][
                         'xpath'] == '/bookstore/b:book/title/@lang')
             assert (field_info['title']['value'][0]['value']['value']['attributes'][
@@ -1175,7 +1325,6 @@ def test_directory_origin_configuration_include_field_xpaths(sdc_builder, sdc_ex
             assert 'xmlns:b' not in record_header[0]
             assert 'xmlns:prc' not in record_header[0]
             # Test for Field Headers .Currently using _data property since api for field header is not there.
-            field_info = output_records[0]._data['value']['value']
             assert 'attributes' not in field_info['title']['value'][0]['value']['attr|lang']
             assert 'attributes' not in field_info['title']['value'][0]['value']['value']
             assert 'attributes' not in field_info['prc:price']['value'][0]['value']['value']
@@ -1186,15 +1335,81 @@ def test_directory_origin_configuration_include_field_xpaths(sdc_builder, sdc_ex
 
 @pytest.mark.parametrize('data_format', ['JSON'])
 @pytest.mark.parametrize('json_content', ['ARRAY_OBJECTS', 'MULTIPLE_OBJECTS'])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_json_content(sdc_builder, sdc_executor, data_format, json_content):
-    pass
+def test_directory_origin_configuration_json_content(sdc_builder, sdc_executor, shell_executor, data_format,
+                                                     file_writer, json_content):
+    """Verify Directory origin configurations for JSON contents type (i.e. ARRAY_OBJECT and MULTIPLE_OBJECTS)."""
+    files_directory = os.path.join('/tmp', get_random_string())
+    FILE_NAME = f'{get_random_string()}.json'
+    records = [{f'Key{i}': f'Value{i}'} for i in range(3)]
+    raw_records = (json.dumps(records)
+                   if json_content == 'ARRAY_OBJECTS'
+                   else ''.join(json.dumps(record) for record in records))
+    try:
+        logger.debug('Creating files directory %s ...', files_directory)
+        shell_executor(f'mkdir {files_directory}')
+        file_writer(os.path.join(files_directory, FILE_NAME), raw_records)
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        directory = pipeline_builder.add_stage('Directory')
+        directory.set_attributes(data_format=data_format,
+                                 files_directory=files_directory,
+                                 file_name_pattern="*.json",
+                                 file_name_pattern_mode='GLOB',
+                                 json_content=json_content)
+        trash = pipeline_builder.add_stage('Trash')
+        directory >> trash
+        pipeline = pipeline_builder.build()
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        output_records = snapshot[directory.instance_name].output
+
+        assert records == [record.field for record in output_records]
+    finally:
+        sdc_executor.stop_pipeline(pipeline)
+        shell_executor(f'rm -r {files_directory}')
 
 
 @pytest.mark.parametrize('data_format', ['DELIMITED'])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_lines_to_skip(sdc_builder, sdc_executor, data_format):
-    pass
+def test_directory_origin_configuration_lines_to_skip(sdc_builder, sdc_executor, data_format, shell_executor,
+                                                      file_writer):
+    """Verify if DC skips the delimited file with given value."""
+    files_directory = os.path.join('/tmp', get_random_string())
+    FILE_NAME = 'delimited_file.csv'
+    FILE_CONTENTS = """Field11,Field12,Field13
+Field21,Field22,Field23
+Field31,Field32,Field33
+Field41,Field42,Field43
+Field51,Field52,Field53"""
+    try:
+        logger.debug('Creating files directory %s ...', files_directory)
+        shell_executor(f'mkdir {files_directory}')
+        file_writer(os.path.join(files_directory, FILE_NAME), FILE_CONTENTS)
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        directory = pipeline_builder.add_stage('Directory')
+        directory.set_attributes(data_format=data_format,
+                                 files_directory=files_directory,
+                                 file_name_pattern="*.csv",
+                                 file_name_pattern_mode='GLOB',
+                                 delimiter_character=",",
+                                 lines_to_skip=3)
+        trash = pipeline_builder.add_stage('Trash')
+        directory >> trash
+        pipeline = pipeline_builder.build()
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        output_records = snapshot[directory.instance_name].output
+
+        assert 2 == len(output_records)
+        assert output_records[0].field == OrderedDict(zip([str(i) for i in range(0, 3)],
+                                                      FILE_CONTENTS.split('\n')[3].split(',')))
+        assert output_records[1].field == OrderedDict(zip([str(i) for i in range(0, 3)],
+                                                      FILE_CONTENTS.split('\n')[4].split(',')))
+    finally:
+        shell_executor(f'rm -r {files_directory}')
+        sdc_executor.stop_pipeline(pipeline)
 
 
 @pytest.mark.parametrize('data_format', ['LOG'])
@@ -1223,16 +1438,42 @@ def test_directory_origin_configuration_max_files_soft_limit(sdc_builder, sdc_ex
     pass
 
 
-@pytest.mark.parametrize('data_format', ['TEXT'])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_max_line_length(sdc_builder, sdc_executor, data_format):
-    pass
+@pytest.mark.parametrize('data_format', ['LOG', 'TEXT'])
+@pytest.mark.parametrize('max_line_length', [155, 82])
+def test_directory_origin_configuration_max_line_length(sdc_builder, sdc_executor, data_format,
+                                                        shell_executor, file_writer, max_line_length):
+    """Check how Directory origin read line in text and log file with Max Line Length set.
+    Case 1 Max Line Length > length of record -> Should read complete record
+    Case 2 Max Line Length < length of record -> Should truncate the record to Max Line Length value.
+    """
+    extension = 'txt' if data_format == 'TEXT' else 'log'
+    file_name = 'sample_input_file.{extension}'.format(extension=extension)
+    file_content = '2019-04-30 08:23:53 AM [INFO] [streamsets.sdk.sdc_api] Pipeline Filewriterpipeline5340a2b5-b792-45f7-ac44-cf3d6df1dc29 reached status EDITED (took 0.00 s).'
+    field_path_to_regex_group_mapping = LOG_FIELD_MAPPING
+    try:
+        files_directory = create_file_and_directory(file_name, file_content, shell_executor, file_writer)
 
+        attributes = {'data_format': data_format,
+                      'file_name_pattern': 'sample_input_*',
+                      'file_name_pattern_mode': 'GLOB',
+                      'files_directory': files_directory,
+                      'max_line_length': max_line_length,
+                      'field_path_to_regex_group_mapping': field_path_to_regex_group_mapping,
+                      'regular_expression': r'(\S+) (\S+) (\S+) (\S+) (\S+) (.*)',
+                      'log_format': 'REGEX'}
+        directory, pipeline = get_directory_to_trash_pipeline(sdc_builder, attributes)
 
-@pytest.mark.parametrize('data_format', ['LOG'])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_max_line_length(sdc_builder, sdc_executor, data_format):
-    pass
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        record = snapshot[directory].output[0]
+
+        if data_format == 'TEXT':
+            assert record.field['text'] == file_content[:max_line_length]
+        else:
+            assert record.field['/message'] == file_content[55:max_line_length]
+    finally:
+        sdc_executor.stop_pipeline(pipeline)
+        shell_executor(f'rm -r {files_directory}')
 
 
 @pytest.mark.parametrize('data_format', ['JSON'])
@@ -1248,7 +1489,7 @@ def test_directory_origin_configuration_max_record_length_in_chars(sdc_builder, 
 
 
 @pytest.mark.parametrize('data_format', ['XML'])
-@pytest.mark.parametrize('max_record_length_in_chars', [238, 240, 260])
+@pytest.mark.parametrize('max_record_length_in_chars', [206, 208, 220])
 def test_directory_origin_configuration_max_record_length_in_chars_xml(sdc_builder, sdc_executor, shell_executor,
                                                                        file_writer, data_format,
                                                                        max_record_length_in_chars):
@@ -1265,7 +1506,7 @@ def test_directory_origin_configuration_max_record_length_in_chars_xml(sdc_build
                                   <request>GET /index.html 200</request>
                               </msg>
                           </root>"""
-
+    EXPECTED_OUTPUT = {'time': [{'value': '8/12/2016 6:01:00'}], 'request': [{'value': 'GET /index.html 200'}]}
     try:
         logger.debug('Creating files directory %s ...', files_directory)
         shell_executor(f'mkdir {files_directory}')
@@ -1277,7 +1518,7 @@ def test_directory_origin_configuration_max_record_length_in_chars_xml(sdc_build
                                  files_directory=files_directory,
                                  file_name_pattern='xml_max_record_length_in_chars_file*',
                                  file_name_pattern_mode='GLOB',
-                                 delimeter_element='msg',
+                                 delimiter_element='msg',
                                  max_record_length_in_chars=max_record_length_in_chars)
         trash = pipeline_builder.add_stage('Trash')
         directory >> trash
@@ -1287,17 +1528,12 @@ def test_directory_origin_configuration_max_record_length_in_chars_xml(sdc_build
         snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True, batch_size=3).snapshot
         output_records = snapshot[directory.instance_name].output
 
-        if max_record_length_in_chars < 240:
+        if max_record_length_in_chars < 208:
             assert not snapshot[directory].output
         else:
-            item_list = output_records[0].field['msg']
-            rows_from_snapshot = [{item['time'][0]['value'].value: item['request'][0]['value'].value}
-                                  for item in item_list]
-            # Parse input xml data to verify results from snapshot.
-            root = ElementTree.fromstring(FILE_CONTENTS)
-            expected_data = [{msg.find('time').text: msg.find('request').text}
-                             for msg in root.iter('msg')]
-            assert rows_from_snapshot == expected_data
+            msg_field = get_xml_output_field(directory, output_records[0].field, 'msg')
+            assert msg_field == EXPECTED_OUTPUT
+
     finally:
         sdc_executor.stop_pipeline(pipeline)
         shell_executor(f'rm -r {files_directory}')
@@ -1371,7 +1607,10 @@ def test_directory_origin_configuration_namespaces(sdc_builder, sdc_executor, sh
 
         sdc_executor.add_pipeline(pipeline)
         snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True, batch_size=3).snapshot
-        item_list = [output.field for output in snapshot[directory.instance_name].output]
+
+        item_list = [get_xml_output_field(directory, output.field, 'msg')
+                     for output in snapshot[directory.instance_name].output]
+
         rows_from_snapshot = [{item['time'][0]['value'].value: item['request'][0]['value'].value}
                               for item in item_list]
         # Parse input xml data to verify results from snapshot using xpath for search.
@@ -1384,11 +1623,11 @@ def test_directory_origin_configuration_namespaces(sdc_builder, sdc_executor, sh
         shell_executor(f'rm -r {files_directory}')
 
 
-@pytest.mark.parametrize('data_format', ['DELIMITED'])
-@pytest.mark.parametrize('parse_nulls', [True])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_null_constant(sdc_builder, sdc_executor, data_format, parse_nulls):
-    pass
+@pytest.mark.parametrize('stage_attributes', [{'data_format': 'DELIMITED', 'parse_nulls': True}])
+def test_null_constant(sdc_builder, sdc_executor, stage_attributes, keep_data, shell_executor, delimited_file_writer):
+    """Verify that the Null Constant configuration works as expected when Parse Nulls is enabled for delimited files."""
+    test_parse_nulls(sdc_builder, sdc_executor, stage_attributes, keep_data,
+                     shell_executor, delimited_file_writer, '\\N')
 
 
 @pytest.mark.skip('Not yet implemented')
@@ -1455,7 +1694,9 @@ def test_directory_origin_configuration_output_field_attributes(sdc_builder, sdc
 
         sdc_executor.add_pipeline(pipeline)
         snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True, batch_size=3).snapshot
-        item_list = [output.field for output in snapshot[directory.instance_name].output]
+
+        item_list = [get_xml_output_field(directory, output.field, 'b:book')
+                     for output in snapshot[directory.instance_name].output]
         rows_from_snapshot = [{item['title'][0]['value'].value: item['prc:price'][0]['value'].value}
                               for item in item_list]
         # Parse input xml data to verify results from snapshot using xpath for search.
@@ -1468,8 +1709,9 @@ def test_directory_origin_configuration_output_field_attributes(sdc_builder, sdc
         if output_field_attributes:
             # Test for Field Attributes. Currently using _data property since attributes are not accessible with the
             # field property.
-            field_header = output_records[0]._data['value']['attributes']
-            assert field_header['xmlns:b'] == 'http://books.com/book'
+            output_data = output_records[0]._data['value']
+            field_header = get_xml_output_field(directory, output_data, 'value', 'b:book')
+            assert field_header['attributes']['xmlns:b'] == 'http://books.com/book'
         else:
             assert 'attributes' not in output_records[0]._data['value']
     finally:
@@ -1477,11 +1719,44 @@ def test_directory_origin_configuration_output_field_attributes(sdc_builder, sdc
         shell_executor(f'rm -r {files_directory}')
 
 
-@pytest.mark.parametrize('data_format', ['DELIMITED'])
-@pytest.mark.parametrize('parse_nulls', [False, True])
-@pytest.mark.skip('Not yet implemented')
-def test_directory_origin_configuration_parse_nulls(sdc_builder, sdc_executor, data_format, parse_nulls):
-    pass
+@pytest.mark.parametrize('null_constant', ['TEST_DATA'])
+@pytest.mark.parametrize('stage_attributes', [{'data_format': 'DELIMITED', 'parse_nulls': False},
+                                              {'data_format': 'DELIMITED', 'parse_nulls': True}])
+def test_parse_nulls(sdc_builder, sdc_executor, stage_attributes, keep_data,
+                     shell_executor, delimited_file_writer, null_constant):
+    """Verify that Data Collector replaces the specified string constant with null values for delimited files."""
+    files_directory = os.path.join('/tmp', get_random_string())
+    FILE_NAME = f'{get_random_string()}.csv'
+    FILE_CONTENTS = [['Field 1', null_constant, 'Field 3', 'Field 4']]
+    EXPECTED_OUTPUT = OrderedDict([('0', 'Field 1'),
+                                   ('1', None if stage_attributes['parse_nulls'] else null_constant),
+                                   ('2', 'Field 3'),
+                                   ('3', 'Field 4')])
+
+    try:
+        logger.debug('Creating files directory %s ...', files_directory)
+        shell_executor(f'mkdir {files_directory}')
+        delimited_file_writer(os.path.join(files_directory, FILE_NAME), FILE_CONTENTS, 'CSV', ',')
+
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        directory = pipeline_builder.add_stage('Directory').set_attributes(files_directory=files_directory,
+                                                                           file_name_pattern='*.csv',
+                                                                           **stage_attributes)
+        if stage_attributes['parse_nulls']:
+            directory.null_constant = null_constant
+        trash = pipeline_builder.add_stage('Trash')
+        pipeline_finisher = pipeline_builder.add_stage('Pipeline Finisher Executor')
+        directory >> [trash, pipeline_finisher]
+        pipeline = pipeline_builder.build()
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        records = [record.field for record in snapshot[directory].output]
+
+        assert records == [EXPECTED_OUTPUT]
+    finally:
+        if not keep_data:
+            shell_executor(f'rm -r {files_directory}')
 
 
 @pytest.mark.parametrize('read_order', ['TIMESTAMP'])
@@ -1567,45 +1842,54 @@ def test_directory_origin_configuration_quote_character(sdc_builder, sdc_executo
         shell_executor(f'rm -r {files_directory}')
 
 
-@pytest.mark.parametrize('data_format', ['WHOLE_FILE'])
-def test_directory_origin_configuration_rate_per_second(sdc_builder, sdc_executor, data_format, shell_executor):
-    """Test if Directory origin honours rate_per_second attribute. Here we will run pipeline with its 2 values
-    We will check number of records / files read is greater when rate is set to 1 MB as compare to 0.5 MB value.
+@pytest.mark.parametrize('stage_attributes', [{'data_format': 'WHOLE_FILE'}])
+def test_rate_per_second(sdc_builder, sdc_executor, stage_attributes, shell_executor, file_writer, keep_data):
+    """Test if Directory origin honors "Rate Per Second" configuration.
+
+    Pipeline will be run four times with configuration set to different values
+    and the expected proportionality of the value and the pipeline throughput checked.
     """
+    FILE_NAME = 'file.txt'
+    DATA = 'a' * 1024  # 1 KB file. This needs to be small as larger values make the Jython processor we use to
+                       # write the file go crazy.
+
     files_directory = os.path.join('/tmp', get_random_string())
+    logger.debug('Creating files directory %s ...', files_directory)
+    shell_executor(f'mkdir {files_directory}')
 
     try:
-        logger.debug('Creating files directory %s ...', files_directory)
-        shell_executor(f'mkdir {files_directory}')
-        write_multiple_files(sdc_builder, sdc_executor, files_directory, 'rate_per')
+        file_writer(os.path.join(files_directory, FILE_NAME), DATA)
+        pipeline_builder = sdc_builder.get_pipeline_builder()
+        # Buffer size needs to be set to a small value to go along with the small file we're aiming to read.
+        directory = pipeline_builder.add_stage('Directory').set_attributes(buffer_size_in_bytes=10,
+                                                                           files_directory=files_directory,
+                                                                           file_name_pattern=FILE_NAME,
+                                                                           **stage_attributes)
+        # Using Whole File data format at the origin requires a destination that supports it, as well. Local FS
+        # is an easy one to use.
+        local_fs = pipeline_builder.add_stage('Local FS').set_attributes(data_format='WHOLE_FILE',
+                                                                         directory_template='/tmp',
+                                                                         file_name_expression=FILE_NAME,
+                                                                         file_type='WHOLE_FILE',
+                                                                         files_prefix='')
+        directory >> local_fs
+        pipeline = pipeline_builder.build()
+        pipeline_throughputs = []
+        for rate_per_second in ['1000', '500', '100', '50']:
+            directory.rate_per_second = rate_per_second
+            benchmark_data = sdc_executor.benchmark_pipeline(pipeline, record_count=1, runs=1)
+            throughput = benchmark_data['throughput_mean']
+            logger.info('Pipeline with rate per second of %s had mean throughput of %s records/s',
+                        rate_per_second,
+                        throughput)
+            pipeline_throughputs.append(throughput)
+            shell_executor(f"rm {os.path.join('/tmp', FILE_NAME)}")
 
-        def run_pipeline(attributes):
-            directory, pipeline = get_directory_to_trash_pipeline(sdc_builder, attributes)
-
-            sdc_executor.add_pipeline(pipeline)
-            sdc_executor.start_pipeline(pipeline)
-            time.sleep(1)
-            sdc_executor.stop_pipeline(pipeline)
-            directory_pipeline_history = sdc_executor.get_pipeline_history(pipeline)
-            return directory_pipeline_history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count
-
-        #1st run with rate per second as 0.5 MB
-        attributes = {'data_format': data_format,
-                      'file_name_pattern': 'rate_*',
-                      'file_name_pattern_mode': 'GLOB',
-                      'files_directory': files_directory,
-                      'rate_per_second': '${0.5 * MB}'}
-        msgs_result_count1 = run_pipeline(attributes)
-
-        #2nd run with rate per second as 1 MB
-        attributes['rate_per_second'] = '${1 * MB}'
-        msgs_result_count2 = run_pipeline(attributes)
-
-        # As there is no linear relation between the two we can not do exact assertions.
-        # We can at least expect more number of records read when this value is increased.
-        assert msgs_result_count2 > msgs_result_count1
+        # The rate_per_second we iterate over should result in monotonically decreasing throughput values.
+        assert pipeline_throughputs[0] > pipeline_throughputs[1] > pipeline_throughputs[2] > pipeline_throughputs[3]
     finally:
-        shell_executor(f'rm -r {files_directory}')
+        if not keep_data:
+            shell_executor(f'rm -r {files_directory}')
 
 
 @pytest.mark.parametrize('read_order', ['LEXICOGRAPHICAL', 'TIMESTAMP'])
@@ -1828,6 +2112,40 @@ def test_directory_origin_configuration_use_custom_log_format(sdc_builder, sdc_e
     pass
 
 
+def test_directory_no_read_permissions(sdc_builder, sdc_executor, shell_executor):
+    FILES_DIRECTORY = '/tmp'
+
+    random_str = get_random_string(string.ascii_letters, 10)
+    file_path = os.path.join(FILES_DIRECTORY, random_str)
+
+    shell_executor(f"""
+        mkdir {file_path}
+        chmod -R 000 {file_path}
+    """)
+
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+    directory = pipeline_builder.add_stage('Directory')
+    directory.set_attributes(data_format='TEXT',
+                             files_directory=file_path,
+                             file_name_pattern='*')
+    trash = pipeline_builder.add_stage('Trash')
+    directory >> trash
+    pipeline = pipeline_builder.build()
+
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        sdc_executor.validate_pipeline(pipeline)
+        assert False, 'Should not reach here'
+    except Exception as error:
+        assert error.issues['issueCount'] == 1
+
+        assert 'SPOOLDIR_38' in error.issues['stageIssues']['Directory_01'][0]['message']
+        assert 'FILES' in error.issues['stageIssues']['Directory_01'][0]['configGroup']
+    finally:
+        shell_executor(f'rm -R {file_path}')
+
+
 # Util functions
 
 LOG_FIELD_MAPPING = [{'fieldPath': '/date', 'group': 1},
@@ -1840,6 +2158,7 @@ JSON_DATA = [{"name": "Manish Zope", "age": 35, "car": "lll company", "address":
              {"name": "Sachin Tope", "age": 30, "car": "hhh company",
               "address": "FLAT NO 555 xyz society opposite to abc school near ddd chowk wakad Pune - 411057"},
              {"name": "Sagar HiFi", "age": 28, "car": "rrr company", "address": "ttt"}]
+
 AVRO_RECORDS = [
     {
         "name": "sdc1",
@@ -1913,13 +2232,14 @@ def get_directory_to_trash_pipeline(sdc_builder, attributes):
     directory = pipeline_builder.add_stage('Directory')
     directory.set_attributes(**attributes)
     trash = pipeline_builder.add_stage('Trash')
-    directory >> trash
+    # pipeline_finisher = pipeline_builder.add_stage('Pipeline Finisher Executor')
+    directory >> [trash]
     pipeline = pipeline_builder.build()
     return directory, pipeline
 
 
 def create_file_and_directory(file_name, file_content, shell_executor, file_writer, delimiter_format_type=None,
-                          delimiter_character=None):
+                              delimiter_character=None):
     files_directory = os.path.join('/tmp', get_random_string())
     logger.debug('Creating files directory %s ...', files_directory)
     shell_executor(f'mkdir {files_directory}')
@@ -2038,7 +2358,9 @@ def execute_pipeline_and_verify_output(sdc_executor, directory, pipeline, data_f
                                            'category': 'org.StreamSets.Log4j', 'ndc': 'unknown',
                                            'message': 'This is sample log message'}
     elif data_format == 'XML':
-        msg_field = output_records[0].field['msg']
+        xml_output_field = get_xml_output_field(directory, output_records[0].field, 'root')
+        msg_field = xml_output_field['msg']
+
         assert msg_field[0]['metainfo'][0]['value'] == 'Index page:More info about content'
         assert msg_field[0]['request'][0]['value'] == 'GET /index.html 200'
     elif data_format == 'SDC_JSON':

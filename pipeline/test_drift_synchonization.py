@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 
 import pytest
 import sqlalchemy
+from streamsets.testframework.environments.hortonworks import AmbariCluster
 from streamsets.testframework.markers import database, cluster, sdc_min_version
 from streamsets.testframework.utils import get_random_string, Version
 
@@ -142,6 +143,12 @@ def test_null_fields(sdc_builder, sdc_executor, cluster):
     """
     if getattr(cluster, 'kerberized_services', False) and 'hive' in cluster.kerberized_services:
         pytest.skip('Test runs only in non-kerberized environment till SDC-9324 is fixed.')
+
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name = get_random_string(string.ascii_lowercase, 20)
 
     pipeline_builder = sdc_builder.get_pipeline_builder()
@@ -210,6 +217,12 @@ def test_cold_start(sdc_builder, sdc_executor, cluster, db, stored_as_avro, exte
     """
     if getattr(cluster, 'kerberized_services', False) and 'hive' in cluster.kerberized_services:
         pytest.skip('Test runs only in non-kerberized environment till SDC-9324 is fixed.')
+
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name = get_random_string(string.ascii_lowercase, 20)
 
     db_for_path = 'default' if not db else f'{db}.db' if db != 'default' else db
@@ -308,6 +321,11 @@ def test_database_and_table_location(sdc_builder, sdc_executor, cluster,
     if getattr(cluster, 'kerberized_services', False) and 'hive' in cluster.kerberized_services:
         pytest.skip('Test runs only in non-kerberized environment till SDC-9324 is fixed.')
     table_name = get_random_string(string.ascii_lowercase, 20)
+
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
 
     if custom_table_location and not external_table:
         pytest.skip('Test skipped : SDC-5459: Hive processor is ignoring location for internal tables')
@@ -421,6 +439,11 @@ def test_partition_locations(sdc_builder, sdc_executor, cluster):
         hive_metadata >> hive_metastore
 
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     pipeline_builder = sdc_builder.get_pipeline_builder()
     raw_data = [dict(id=1, name='abc', part1=get_random_string(), part2=get_random_string(), part3=get_random_string()),
                 dict(id=2, name='def', part1=get_random_string(), part2=get_random_string(), part3=get_random_string()),
@@ -527,6 +550,11 @@ def test_sdc_types(sdc_builder, sdc_executor, cluster, sdc_type, hive_type, supp
     """
     if getattr(cluster, 'kerberized_services', False) and 'hive' in cluster.kerberized_services:
         pytest.skip('Test runs only in non-kerberized environment till SDC-9324 is fixed.')
+
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
 
     table_name = get_random_string(string.ascii_lowercase, 20)
 
@@ -671,6 +699,12 @@ def test_partition_types(sdc_builder, sdc_executor, cluster, partition_type, par
     """
     if getattr(cluster, 'kerberized_services', False) and 'hive' in cluster.kerberized_services:
         pytest.skip('Test runs only in non-kerberized environment till SDC-9324 is fixed.')
+
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name = get_random_string(string.ascii_lowercase, 20)
 
     raw_data = [OrderedDict(id=1, name='abc', value=partition_value, part=partition_value)]
@@ -731,6 +765,11 @@ def test_multiplexing(sdc_builder, sdc_executor, cluster):
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_suffix = get_random_string(string.ascii_lowercase, 10)
 
     raw_data = [dict(id=1, name='San Francisco', table=f'towns_{table_suffix}', country='US', year='2016'),
@@ -812,6 +851,11 @@ def test_special_characters_in_partition_value(sdc_builder, sdc_executor, cluste
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name = get_random_string(string.ascii_lowercase, 20)
     partition_values = OrderedDict([("-", True), ("_", True), ("$", True), (",", True),
                                     ("(", True), (")", True), ("&", True), ("@", True),
@@ -904,6 +948,10 @@ def test_special_characters_in_table_and_columns(sdc_builder, sdc_executor, clus
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
 
     object_name_prefix_suffix = get_random_string(string.ascii_lowercase, 5)
 
@@ -976,6 +1024,11 @@ def test_keywords_in_object_names(sdc_builder, sdc_executor, cluster, keyword):
         dev_raw_data_source >> expression_evaluator >> field_remover >> hive_metadata
         hive_metadata >> hadoop_fs
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name = keyword
     db = keyword
 
@@ -1052,6 +1105,10 @@ def test_hdfs_schema_serialization(sdc_builder, sdc_executor, cluster, location)
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
 
     table_name = get_random_string(string.ascii_lowercase, 20)
 
@@ -1123,6 +1180,10 @@ def test_decimal_values(sdc_builder, sdc_executor, cluster):
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
 
     table_name = get_random_string(string.ascii_lowercase, 20)
 
@@ -1199,6 +1260,11 @@ def test_partial_input(sdc_builder, sdc_executor, cluster):
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name = get_random_string(string.ascii_lowercase, 20)
 
     raw_data = [dict(idx=0), dict(idx=1),
@@ -1263,6 +1329,11 @@ def test_column_drift(sdc_builder, sdc_executor, cluster, external_table):
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name_suffix = get_random_string(string.ascii_lowercase, 20)
 
     raw_data = [OrderedDict([('id', 0), ('table', f'column_rename_add{table_name_suffix}')]),
@@ -1383,6 +1454,11 @@ def test_unsupported_table_data_formats(sdc_builder, sdc_executor, cluster, data
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name = get_random_string(string.ascii_lowercase, 20)
 
     raw_data = dict(id=str(uuid.uuid4()), name=get_random_string(string.ascii_lowercase, 20))
@@ -1447,6 +1523,11 @@ def test_drift_multiple_open_partitions(sdc_builder, sdc_executor, cluster):
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name = get_random_string(string.ascii_lowercase, 20)
 
     raw_data = [dict(id=str(uuid.uuid4()), part='part1'),
@@ -1525,6 +1606,11 @@ def test_sub_partitions(sdc_builder, sdc_executor, cluster):
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name = get_random_string(string.ascii_lowercase, 20)
 
     raw_data = [dict(id=1, name='abc', timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
@@ -1664,7 +1750,6 @@ def test_native_parquet_timestamps(sdc_builder, sdc_executor, cluster):
                              data_format='AVRO',
                              directory_in_header=True,
                              use_roll_attribute=True,
-                             produce_events=True,
                              max_records_in_file=1)
 
     hive_metastore = pipeline_builder.add_stage('Hive Metastore', type='destination')
@@ -1714,6 +1799,11 @@ def test_events(sdc_builder, sdc_executor, cluster):
         hive_metadata >> hadoop_fs
         hive_metadata >> hive_metastore
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     table_name = get_random_string(string.ascii_lowercase, 20)
 
     raw_data = [dict(id=str(uuid.uuid4()), name='abc', part='part1'),
@@ -1810,6 +1900,11 @@ def test_hive_query_executor(sdc_builder, sdc_executor, cluster, stop_on_query_f
 
         dev_raw_data_source >> hive_query_executor
     """
+    # based on SDC-13915
+    if (isinstance(cluster, AmbariCluster) and Version(cluster.version) == Version('3.1')
+        and Version(sdc_builder.version) < Version('3.8.1')):
+        pytest.skip('Hive stages not available on HDP 3.1.0.0 for SDC versions before 3.8.1')
+
     raw_data = [dict(name='multiple_queries_all_success',
                      query1='select 11',
                      query2='select 12',
@@ -1859,6 +1954,81 @@ def test_hive_query_executor(sdc_builder, sdc_executor, cluster, stop_on_query_f
         expected_event_type, expected_event_values = event_type_expected_query_values[event_idx]
         assert expected_event_type == event_record.header['values']["sdc.event.type"]
         assert expected_event_values == stage.event_records[event_idx].field
+
+
+@sdc_min_version('3.0.0.0')
+@cluster('cdh', 'hdp')
+def test_hive_avro_schema_contains_only_columninfo(sdc_builder, sdc_executor, cluster):
+    """Validate that the avro Schema in records contains strictly hive table column information
+        and not partition information.
+
+        Currently, we use the "DESC <tableName>" query to gather table information
+        results in partition names appear twice in the resultset - one with column info and one with partiton info,
+        so they are counted twice.
+        This behavior is fixed as a part of SDC-13898
+
+        The pipeline looks like:
+        dev_raw_data_source >> hive_metadata
+        hive_metadata >> hadoop_fs
+        hive_metadata >> hive_metastore
+    """
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    id, username = 'id', 'username'
+    raw_data = json.dumps({id: 1, username: 'abc'})
+
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.set_attributes(data_format='JSON',
+                                       raw_data=raw_data,
+                                       stop_after_first_batch=True)
+
+    partition_name = 'partition1'
+    partition_configuration = [
+        {'name': partition_name, 'valueType': 'STRING', 'valueEL': '${record:value("/username")}'}
+    ]
+
+    hive_metadata = pipeline_builder.add_stage('Hive Metadata')
+    hive_metadata.set_attributes(data_format='AVRO',
+                                 partition_configuration=partition_configuration,
+                                 table_name=table_name)
+
+    hadoop_fs = pipeline_builder.add_stage('Hadoop FS', type='destination')
+    hadoop_fs.set_attributes(avro_schema_location='HEADER',
+                             data_format='AVRO',
+                             directory_in_header=True,
+                             use_roll_attribute=True)
+
+    hive_metastore = pipeline_builder.add_stage('Hive Metastore', type='destination')
+
+    dev_raw_data_source >> hive_metadata
+    hive_metadata >> hadoop_fs
+    hive_metadata >> hive_metastore
+
+    pipeline = pipeline_builder.build().configure_for_environment(cluster)
+    sdc_executor.add_pipeline(pipeline)
+
+    hive_cursor = cluster.hive.client.cursor()
+    create_table_command = ('CREATE TABLE IF NOT EXISTS {0} ({1} INT, {2} STRING) '
+                            'PARTITIONED BY ({3} STRING) '
+                            ' STORED AS AVRO'
+                            ).format(table_name, id, username, partition_name)
+    logger.info('Creating table %s in Hive', table_name)
+    hive_cursor.execute(create_table_command)
+
+    try:
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.get_pipeline_status(pipeline).wait_for_status(status='FINISHED')
+
+        all_records = snapshot[hive_metadata.instance_name].output_lanes[hive_metadata.output_lanes[0]]
+        assert len(all_records) == 1
+
+        avro_schema = json.loads(all_records[0].header['values']['avroSchema'])
+        column_list = [field['name'] for field in avro_schema['fields']]
+
+        assert id and username in column_list and partition_name not in column_list
+    finally:
+        logger.info('Dropping table %s in Hive...', table_name)
+        hive_cursor.execute('DROP TABLE {}'.format(table_name))
 
 
 def _get_qualified_table_name(db, table_name):

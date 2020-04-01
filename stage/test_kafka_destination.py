@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import string
 
@@ -35,60 +36,69 @@ def kafka_check(cluster):
 #
 
 @cluster('cdh', 'kafka')
-def test_kafka_destination(sdc_builder, sdc_executor, cluster):
-    """Send simple text messages into Kafka Destination from Dev Raw Data Source and
-       confirm that Kafka successfully reads them using KafkaConsumer from cluster.
-       Specifically, this would look like:
+def test_kafka_destination_topic_resolution(sdc_builder, sdc_executor, cluster):
+    """Test topic resolution in Kafka destination. We configure a pipeline which sends messages to the Kafka topic
+    specified by the record field 'topic'. Then we check that the number of messages available in Kafka topics
+    matches the total number of records processed by the pipeline, and that messages are delivered to the
+    correct topic.
 
-       Kafka Destination Origin pipeline:
-           dev_raw_data_source >> kafka_destination
+    Pipeline: dev_raw_data_source >> kafka_destination
 
     """
-
-    topic = get_random_string(string.ascii_letters, 10)
-    logger.debug('Kafka topic name: %s', topic)
+    # Input data.
+    topic1 = f'stf_{get_random_string(string.ascii_letters, 10)}'
+    topic2 = f'stf_{get_random_string(string.ascii_letters, 10)}'
+    topic3 = f'stf_{get_random_string(string.ascii_letters, 10)}'
+    text1 = get_random_string(string.ascii_letters, 10)
+    text2 = get_random_string(string.ascii_letters, 10)
+    text3 = get_random_string(string.ascii_letters, 10)
+    raw_data = [{'topic': topic1, 'text': text1},
+                {'topic': topic2, 'text': text2},
+                {'topic': topic3, 'text': text3}]
 
     # Build the Kafka destination pipeline.
     builder = sdc_builder.get_pipeline_builder()
-    builder.add_error_stage('Discard')
 
     dev_raw_data_source = builder.add_stage('Dev Raw Data Source')
-    dev_raw_data_source.data_format = 'TEXT'
-    dev_raw_data_source.raw_data = 'Hello World!'
+    dev_raw_data_source.set_attributes(data_format='JSON',
+                                       raw_data='\n'.join(json.dumps(rec) for rec in raw_data))
 
     kafka_destination = builder.add_stage(name='com_streamsets_pipeline_stage_destination_kafka_KafkaDTarget',
                                           library=cluster.kafka.standalone_stage_lib)
-    kafka_destination.topic = topic
-    kafka_destination.data_format = 'TEXT'
+    kafka_destination.set_attributes(runtime_topic_resolution=True,
+                                     topic_expression='${record:value("/topic")}',
+                                     data_format='TEXT',
+                                     text_field_path='/text')
 
     dev_raw_data_source >> kafka_destination
-    kafka_destination_pipeline = builder.build(title='Kafka Destination pipeline').configure_for_environment(cluster)
-    kafka_destination_pipeline.configuration['rateLimit'] = 1
+    pipeline = builder.build().configure_for_environment(cluster)
+    sdc_executor.add_pipeline(pipeline)
 
-    sdc_executor.add_pipeline(kafka_destination_pipeline)
+    # Setup Kafka consumers, one for each topic. Specify timeout so that iteration of consumer is stopped
+    # after that time and specify auto_offset_reset to get messages from beginning.
+    consumer1 = cluster.kafka.consumer(consumer_timeout_ms=1000, auto_offset_reset='earliest')
+    consumer2 = cluster.kafka.consumer(consumer_timeout_ms=1000, auto_offset_reset='earliest')
+    consumer3 = cluster.kafka.consumer(consumer_timeout_ms=1000, auto_offset_reset='earliest')
+    consumer1.subscribe([topic1])
+    consumer2.subscribe([topic2])
+    consumer3.subscribe([topic3])
 
-    # Specify timeout so that iteration of consumer is stopped after that time and
-    # specify auto_offset_reset to get messages from beginning.
-    consumer = cluster.kafka.consumer(consumer_timeout_ms=1000, auto_offset_reset='earliest')
-    consumer.subscribe([topic])
+    # Run pipeline.
+    sdc_executor.start_pipeline(pipeline).wait_for_pipeline_batch_count(10)
+    sdc_executor.stop_pipeline(pipeline)
 
-    # Send messages using pipeline to Kafka Destination.
-    logger.debug('Starting Kafka Destination pipeline and waiting for it to produce 10 records ...')
-    sdc_executor.start_pipeline(kafka_destination_pipeline).wait_for_pipeline_batch_count(10)
+    # Check each topic receives the expected messages and number of records matches total of messages
+    # consumed by Kafka clients.
+    history = sdc_executor.get_pipeline_history(pipeline)
+    record_count = history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count
+    messages1 = [msg.value.decode().strip() for msg in consumer1]
+    messages2 = [msg.value.decode().strip() for msg in consumer2]
+    messages3 = [msg.value.decode().strip() for msg in consumer3]
 
-    logger.debug('Stopping Kafka Destination pipeline and getting the count of records produced in total ...')
-    sdc_executor.stop_pipeline(kafka_destination_pipeline)
-
-    history = sdc_executor.get_pipeline_history(kafka_destination_pipeline)
-    msgs_sent_count = history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count
-    logger.debug('No. of messages sent in the pipeline = %s', msgs_sent_count)
-
-    msgs_received = [message.value.decode().strip() for message in consumer]
-    logger.debug('No. of messages received in Kafka Consumer = %d', (len(msgs_received)))
-
-    logger.debug('Verifying messages with Kafka consumer client ...')
-    assert msgs_sent_count == len(msgs_received)
-    assert msgs_received == [dev_raw_data_source.raw_data] * msgs_sent_count
+    assert all(msg == text1 for msg in messages1)
+    assert all(msg == text2 for msg in messages2)
+    assert all(msg == text3 for msg in messages3)
+    assert record_count == len(messages1) + len(messages2) + len(messages3)
 
 
 @cluster('cdh', 'kafka')
@@ -326,7 +336,6 @@ def test_kafka_write_string_records_round_robin(sdc_builder, sdc_executor, clust
     kafka_destination.topic = topic
     kafka_destination.data_format = 'TEXT'
     kafka_destination.set_attributes(partition_strategy ='ROUND_ROBIN',
-                                     batch_wait_time_in_ms=20000,
                                      topic=topic)
 
     dev_raw_data_source >> kafka_destination
@@ -420,3 +429,72 @@ def validate_schema_was_registered(name, confluent):
     assert schema.fields[0].type.name == 'int'
     assert schema.fields[1].name == 'b'
     assert schema.fields[1].type.name == 'string'
+
+
+@cluster('cdh', 'kafka')
+def test_pipeline_retry_for_exceptions_with_on_error_record_action_stop_pipeline(sdc_builder, sdc_executor, cluster):
+    """ STF test for SDC-8738.
+        Pipeline configuration is set to retry on error.
+        Kafka Producer Destination's onErrorRecord action is set to "STOP PIPELINE"
+        Now, when the pipeline raises a stageException or starting exception,
+        the pipeline should be restarted based on if retry is set or not.
+
+        Previously, *the pipeline was stopped and never retried*,
+        because the OnErrorRecord action was set to "STOP PIPELINE"
+        i.e. the logic for errorRecordException was conflated with StageException and StartingException.
+        But since, this is not a on error record exception,
+        the new and *correct* behavior is to retry the pipeline based on retry logic.
+
+        Now the behavior has been changed to make sure that for StageExceptions and other runtime Exceptions,
+        the pipeline will be retried as per retry settings.
+
+        Check in the history to see that the pipeline transitions from starting to start_error and then retries again
+
+        Kafka Destination Origin pipeline:
+           dev_raw_data_source >> kafka_destination
+
+    """
+    topic = get_random_string(string.ascii_letters, 10)
+    logger.debug('Kafka topic name: %s', topic)
+
+    # Build the Kafka destination pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    dev_raw_data_source = builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.data_format = 'TEXT'
+    dev_raw_data_source.raw_data = 'Hello World!'
+
+    destination = builder.add_stage(name='com_streamsets_pipeline_stage_destination_kafka_KafkaDTarget',
+                                          library=cluster.kafka.standalone_stage_lib)
+    destination.topic = topic
+    destination.data_format = 'TEXT'
+    # Set up some invalid compression type in Kafka Configuration,
+    # so that the pipeline never starts, and throws a STARTING_ERROR instead
+    destination.kafka_configuration = [{'key': 'compression.type', 'value': 'invalid.value'}]
+
+    # Set the on record error handling to 'STOP PIPELINE'
+    # Even with this setting, the expected outcome is that the pipeline should retry on failure,
+    # since the failure here will be a STARTING_ERROR and not a on record error
+    destination.on_record_error = 'STOP_PIPELINE'
+
+    dev_raw_data_source >> destination
+
+    pipeline = builder.build().configure_for_environment(cluster)
+
+    # This is important, since without this the pipeline wouldn't retry
+    pipeline.configuration['shouldRetry'] = True
+
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        logger.debug('Starting Pipeline')
+        sdc_executor.start_pipeline(pipeline=pipeline, wait_for_statuses=['RETRY', 'START_ERROR'])
+
+        history = sdc_executor.get_pipeline_history(pipeline)
+        # The pipeline could have potentially moved on to STARTING state again.
+        # So cannot check for RETRY == history.entries.latest
+        # Check instead if RETRY is in the list of entries. That is validation enough
+        assert 'RETRY' in [entry['status'] for entry in history.entries]
+    finally:
+        sdc_executor.stop_pipeline(pipeline)

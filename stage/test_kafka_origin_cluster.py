@@ -26,6 +26,7 @@ from streamsets.sdk.utils import Version
 from streamsets.testframework.environments.cloudera import ClouderaManagerCluster
 from streamsets.testframework.markers import cluster
 from streamsets.testframework.utils import get_random_string
+from stage.utils.utils_xml import get_xml_output_field
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ SCHEMA = {
     ]
 }
 
+
 @pytest.fixture(scope='function')
 def port():
     return random.randrange(20000, 25000)
@@ -56,6 +58,17 @@ def port():
 def kafka_check(cluster):
     if isinstance(cluster, ClouderaManagerCluster) and not hasattr(cluster, 'kafka'):
         pytest.skip('Kafka tests require Kafka to be installed on the cluster')
+
+
+@pytest.fixture(autouse=True)
+def spark2_check(cluster):
+    """
+    CDH 5 doesn't have Spark 2 installed by default, it's a separate Parcel that might or might no be present. Luckily
+    CDH 6 doesn't have the same problem as Spark 2 is the default version shipped there. We do depend on Spark 2 for a
+    while now, so unless we're sure we have all the services we need, we skip the test.
+    """
+    if isinstance(cluster, ClouderaManagerCluster) and cluster.get_cluster_version().startswith("5.") and not hasattr(cluster, 'spark2_on_yarn'):
+        pytest.skip('Kafka tests require Spark 2 to be installed on the cluster')
 
 
 @cluster('cdh')
@@ -276,7 +289,7 @@ def test_kafka_xml_record_delimiter_element_cluster(sdc_builder, sdc_executor, c
     """
 
     message = '<developers><developer>Alex</developer><developer>Xavi</developer></developers>'
-    expected = ['{\'value\': Alex}', '{\'value\': Xavi}']
+    expected = ['{\'developer\': {\'value\': Alex}}', '{\'developer\': {\'value\': Xavi}}']
 
     if (Version(sdc_builder.version) < MIN_SDC_VERSION_WITH_SPARK_2_LIB and
             ('kafka' in cluster.kerberized_services or cluster.kafka.is_ssl_enabled)):
@@ -888,13 +901,17 @@ def verify_kafka_origin_results(kafka_consumer_pipeline, snapshot_pipeline, sdc_
     snapshot_command = snapshot_pipeline_command.wait_for_finished(timeout_sec=SNAPSHOT_TIMEOUT_SEC)
     snapshot = snapshot_command.snapshot
 
-    basic_data_formats = ['XML', 'CSV', 'SYSLOG', 'COLLECTD', 'PROTOBUF', 'TEXT', 'JSON', 'AVRO', 'AVRO_WITHOUT_SCHEMA']
+    basic_data_formats = ['CSV', 'SYSLOG', 'COLLECTD', 'PROTOBUF', 'TEXT', 'JSON', 'AVRO', 'AVRO_WITHOUT_SCHEMA']
 
     # Verify snapshot data.
     if data_format in basic_data_formats:
         record_field = [record.field for record in snapshot[snapshot_pipeline[0].instance_name].output]
-
         assert message == str(record_field[0])
+
+    elif data_format == 'XML':
+        output_data = [record.field for record in snapshot[snapshot_pipeline[0].instance_name].output][0]
+        record_field = get_xml_output_field(kafka_consumer_pipeline[0], output_data, 'developers')
+        assert message == str(record_field)
 
     elif data_format == 'BINARY':
         record_field = [record.field for record in snapshot[snapshot_pipeline[0].instance_name].output]
@@ -955,5 +972,3 @@ def json_test(sdc_builder, sdc_executor, cluster, message, expected, port):
     finally:
         sdc_executor.stop_pipeline(kafka_consumer_pipeline)
         sdc_executor.stop_pipeline(snapshot_pipeline)
-
-

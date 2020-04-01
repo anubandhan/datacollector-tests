@@ -18,6 +18,7 @@ import string
 import datetime
 
 from pulsar import MessageId
+from stage.utils.utils_xml import get_xml_output_field
 from streamsets.testframework.markers import pulsar, sdc_min_version
 from streamsets.testframework.utils import get_random_string
 
@@ -77,7 +78,8 @@ def verify_results_snapshot(pulsar_consumer_pipeline, snapshot_pipeline_command,
             assert record['Name'] == message['Name']
             assert record['Job'] == message['Job']
         elif data_format == 'XML':
-            assert record['value'] == message
+            output_record = get_xml_output_field(pulsar_consumer_pipeline[0], record, 'text')
+            assert output_record['value'] == message
         elif data_format == 'DELIMITED':
             logger.debug(record)
             logger.debug(message)
@@ -220,7 +222,7 @@ def test_pulsar_origin_standalone_text(sdc_builder, sdc_executor, pulsar):
     dev_raw_data_source = get_dev_raw_data_source(pulsar_producer_pipeline_builder, json_data)
 
     pulsar_producer = get_pulsar_producer_stage(pulsar_producer_pipeline_builder, topic)
-    pulsar_producer.set_attributes(compresion_type='NONE')
+    pulsar_producer.set_attributes(compression_type='NONE')
 
     dev_raw_data_source >> pulsar_producer
     pulsar_producer_pipeline = pulsar_producer_pipeline_builder.build(
@@ -288,7 +290,7 @@ def test_pulsar_origin_standalone_json(sdc_builder, sdc_executor, pulsar):
     pulsar_producer = get_pulsar_producer_stage(pulsar_producer_pipeline_builder, '${record:value(\'/Topic\')}')
     pulsar_producer.set_attributes(data_format='JSON',
                                    partition_type='ROUND_ROBIN',
-                                   compresion_type='LZ4')
+                                   compression_type='LZ4')
 
     dev_raw_data_source >> pulsar_producer
     pulsar_producer_pipeline = pulsar_producer_pipeline_builder.build(
@@ -354,7 +356,7 @@ def test_pulsar_origin_standalone_xml(sdc_builder, sdc_executor, pulsar):
                                    partition_type='SINGLE',
                                    hashing_scheme='JAVA_STRING_HASH',
                                    message_key='12345',
-                                   compresion_type='ZLIB')
+                                   compression_type='ZLIB')
 
     dev_raw_data_source >> pulsar_producer
     pulsar_producer_pipeline = pulsar_producer_pipeline_builder.build(
@@ -459,7 +461,7 @@ def test_pulsar_origin_standalone_topics_list(sdc_builder, sdc_executor, pulsar)
     pulsar_consumer.set_attributes(topics_selector='TOPICS_LIST',
                                    topics_list=topics_list,
                                    subscription_type='EXCLUSIVE',
-                                   ead_compacted=False,
+                                   read_compacted=False,
                                    data_format='JSON')
 
     trash = pulsar_consumer_pipeline_builder.add_stage(label='Trash')
@@ -579,6 +581,7 @@ def test_pulsar_origin_standalone_topics_pattern(sdc_builder, sdc_executor, puls
                                    topics_pattern='persistent://public/default/(' + topic1 + '|' + topic3 + ')',
                                    subscription_type='EXCLUSIVE',
                                    read_compacted=False,
+                                   max_batch_size_in_records=10,
                                    data_format='DELIMITED')
 
     trash = pulsar_consumer_pipeline_builder.add_stage(label='Trash')
@@ -643,7 +646,7 @@ def test_pulsar_origin_standalone_json_tls_encrypt(sdc_builder, sdc_executor, pu
     pulsar_producer = get_pulsar_producer_stage(pulsar_producer_pipeline_builder, '${record:value(\'/Topic\')}')
     pulsar_producer.set_attributes(data_format='JSON',
                                    partition_type='ROUND_ROBIN',
-                                   compresion_type='LZ4',
+                                   compression_type='LZ4',
                                    enable_tls=True)
 
     dev_raw_data_source >> pulsar_producer
@@ -715,8 +718,8 @@ def test_pulsar_origin_standalone_json_tls_mutual_auth(sdc_builder, sdc_executor
     pulsar_producer = get_pulsar_producer_stage(pulsar_producer_pipeline_builder, '${record:value(\'/Topic\')}')
     pulsar_producer.set_attributes(data_format='JSON',
                                    partition_type='ROUND_ROBIN',
-                                   compresion_type='LZ4',
-                                   nable_tls=True,
+                                   compression_type='LZ4',
+                                   enable_tls=True,
                                    enable_mutual_authentication=True)
 
     dev_raw_data_source >> pulsar_producer

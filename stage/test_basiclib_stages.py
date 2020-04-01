@@ -34,73 +34,40 @@ def sdc_common_hook():
     return hook
 
 
-@pytest.fixture(scope='module')
-def pipeline_shell_generator(sdc_executor):
-    builder = sdc_executor.get_pipeline_builder()
-
-    dev_raw_data_source = builder.add_stage('Dev Raw Data Source')
-    dev_raw_data_source.data_format = 'JSON'
-    dev_raw_data_source.raw_data = '{}'
-
-    shell_executor = builder.add_stage('Shell')
-    shell_executor.environment_variables = Configuration(property_key='key', file='${FILE}')
-    shell_executor.script = 'echo `whoami` > $file'
-
-    dev_raw_data_source >> shell_executor
-
-    executor_pipeline = builder.build()
-    executor_pipeline.add_parameters(FILE='/')
-    sdc_executor.add_pipeline(executor_pipeline)
-
-    yield executor_pipeline
-
-
-@pytest.fixture(scope='module')
-def pipeline_shell_read(sdc_executor):
-    builder = sdc_executor.get_pipeline_builder()
-
-    file_source = builder.add_stage('File Tail')
-    file_source.data_format = 'TEXT'
-    file_source.file_to_tail = [
-        dict(fileRollMode='REVERSE_COUNTER', patternForToken='.*', fileFullPath='${FILE}')
-    ]
-
-    trash1 = builder.add_stage('Trash')
-    trash2 = builder.add_stage('Trash')
-
-    file_source >> trash1
-    file_source >> trash2
-
-    read_pipeline = builder.build()
-    read_pipeline.add_parameters(FILE='/')
-    sdc_executor.add_pipeline(read_pipeline)
-
-    yield read_pipeline
-
-
-def test_shell_executor_impersonation(sdc_executor, pipeline_shell_generator, pipeline_shell_read):
+def test_shell_executor_impersonation(sdc_builder, sdc_executor):
     """Test proper impersonation on the Shell executor side. This is a dual pipeline test to test the executor
-    side effect.
-    Test fails till TEST-128 is addressed.
-    """
+    side effect."""
+    # Build a pipeline writing the name of the user executing shell commands to a random file under /tmp.
+    # The Dev Raw Data Source is basically a noop origin and we use a Pipeline Finisher Executor to stop after 1 batch.
+    filepath = f'/tmp/{get_random_string()}'
 
-    # Use this file to exchange data between the executor and our test
-    runtime_parameters = {'FILE': "/tmp/{}".format(get_random_string(string.ascii_letters, 30))}
+    builder = sdc_builder.get_pipeline_builder()
+    dev_raw_data_source = builder.add_stage('Dev Raw Data Source').set_attributes(data_format='JSON', raw_data='{}')
+    shell = builder.add_stage('Shell').set_attributes(script=f'echo `whoami` > {filepath}')
+    pipeline_finisher_executor = builder.add_stage('Pipeline Finisher Executor')
+    dev_raw_data_source >> [shell, pipeline_finisher_executor]
 
-    # Run the pipeline with executor exactly once
-    sdc_executor.start_pipeline(pipeline_shell_generator,
-                                runtime_parameters=runtime_parameters).wait_for_pipeline_batch_count(1)
-    sdc_executor.stop_pipeline(pipeline_shell_generator)
+    shell_pipeline = builder.build()
+    sdc_executor.add_pipeline(shell_pipeline)
+    sdc_executor.start_pipeline(shell_pipeline).wait_for_finished()
 
-    # And retrieve its output
-    snapshot = sdc_executor.capture_snapshot(pipeline=pipeline_shell_read, runtime_parameters=runtime_parameters,
-                                             start_pipeline=True).snapshot
-    sdc_executor.stop_pipeline(pipeline_shell_read)
+    # Build a separate pipeline to read the file written and check, using a snapshot, that the "correct" username
+    # is in the file.
+    builder = sdc_builder.get_pipeline_builder()
+    file_to_tail = [dict(fileRollMode='REVERSE_COUNTER', patternForToken='.*', fileFullPath=f'{filepath}')]
+    file_tail = builder.add_stage('File Tail').set_attributes(data_format='TEXT', file_to_tail=file_to_tail)
+    trash_1 = builder.add_stage('Trash')
+    trash_2 = builder.add_stage('Trash')
+    pipeline_finisher_executor = builder.add_stage('Pipeline Finisher Executor')
+    file_tail >> [trash_1, pipeline_finisher_executor]
+    file_tail >> trash_2
 
-    records = snapshot[pipeline_shell_read.origin_stage].output_lanes[pipeline_shell_read.origin_stage.output_lanes[0]]
-    assert len(records) == 1
-    # Blocked by TEST-128, should be different user
-    assert records[0].field['text'].value == 'sdc'
+    file_tail_pipeline = builder.build()
+    sdc_executor.add_pipeline(file_tail_pipeline)
+    snapshot = sdc_executor.capture_snapshot(file_tail_pipeline, start_pipeline=True).snapshot
+
+    records = [record.field for record in snapshot[file_tail].output_lanes[file_tail.output_lanes[0]]]
+    assert records == [{'text': sdc_executor.username}]
 
 
 def test_stream_selector_processor(sdc_builder, sdc_executor):
@@ -191,10 +158,11 @@ def test_log_parser_processor_multiple_grok_patterns(sdc_builder, sdc_executor):
     log_parser_processor = pipeline_builder.add_stage('Log Parser').set_attributes(field_to_parse='/log',
                                                                                    new_parsed_field='/parsed_log',
                                                                                    log_format="GROK",
+                                                                                   grok_pattern_definition="JUSTLOGLEVEL %{LOGLEVEL:log-level}",
                                                                                    grok_patterns=[
                                                                                        '',
                                                                                        '%{COMBINEDAPACHELOG}',
-                                                                                       '%{LOGLEVEL}'
+                                                                                       '%{JUSTLOGLEVEL}'
                                                                                    ])
 
     trash = pipeline_builder.add_stage('Trash')
@@ -224,7 +192,7 @@ def test_log_parser_processor_multiple_grok_patterns(sdc_builder, sdc_executor):
     assert records[0]['parsed_log']['httpversion'] == '1.0'
     assert records[0]['parsed_log']['timestamp'] == '01/Feb/1998:01:08:46 -0800'
 
-    assert records[1]['parsed_log']['parsedLine'] == 'DEBUG'
+    assert records[1]['parsed_log']['log-level'] == 'DEBUG'
 
 
 @sdc_min_version('3.9.0')
@@ -305,7 +273,7 @@ def test_pipeline_finisher(reset_offset, sdc_builder, sdc_executor):
     origin.raw_data = '{}'
 
     executor = builder.add_stage('Pipeline Finisher Executor')
-    executor.reset_offset = reset_offset
+    executor.reset_origin = reset_offset
 
     origin >> executor
     pipeline = builder.build()
@@ -439,3 +407,39 @@ def test_expression_evaluator(sdc_builder, sdc_executor):
     assert snapshot[expression].output[0].get_field_data('/new_field') == 'Secret 1'
     assert snapshot[expression].output[0].header['values']['new header'] == 'Secret 2'
     assert snapshot[expression].output[0].get_field_data('/a').attributes['new field header'] == 'Secret 3'
+
+
+@sdc_min_version('3.15.0')
+def test_deduplicator_field_to_compare(sdc_builder, sdc_executor):
+    """When field to compare in Record Deduplicator stage doesn't exists, it use On Record Error to manage
+    the DEDUP error. The record error has to be "DEDUP_04: Field Path does not exist in the record".
+
+    dev_raw_data_source >> record_deduplicator  >> trash
+                                                >> trash
+    """
+    raw_data = "Hello"
+    field_to_compare = ["/ff", "/text"]
+
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.set_attributes(data_format='TEXT',
+                                       raw_data=raw_data)
+    record_deduplicator = pipeline_builder.add_stage('Record Deduplicator')
+    record_deduplicator.set_attributes(on_record_error='TO_ERROR',
+                                       compare="SPECIFIED_FIELDS",
+                                       fields_to_compare=field_to_compare)
+    trash_one = pipeline_builder.add_stage('Trash')
+    trash_second = pipeline_builder.add_stage('Trash')
+
+    dev_raw_data_source >> record_deduplicator >> trash_one
+    record_deduplicator >> trash_second
+
+    pipeline = pipeline_builder.build('test_deduplicator_field_to_compare')
+    sdc_executor.add_pipeline(pipeline)
+
+    snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+    sdc_executor.stop_pipeline(pipeline)
+
+    stage = snapshot[record_deduplicator.instance_name]
+    assert 1 == len(stage.error_records)
+    assert 'DEDUP_04' == stage.error_records[0].header['errorCode']

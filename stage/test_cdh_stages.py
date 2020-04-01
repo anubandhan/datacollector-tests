@@ -190,8 +190,8 @@ def test_kudu_destination_decimal_type(sdc_builder, sdc_executor, cluster):
     if not hasattr(cluster, 'kudu'):
         pytest.skip('Kudu tests only run against clusters with the Kudu service present.')
 
-    if not cluster.kudu.version >= '1.7.0':
-        pytest.skip('Test only designed to run on Kudu version >= 1.7.0')
+    if not Version(cluster.kudu.version) >= Version('1.7.0'):
+        pytest.skip(f'Test only designed to run on Kudu version >= 1.7.0, but found {cluster.kudu.version}')
 
     # Generate some data.
     tour_de_france_contenders = [dict(favorite_rank=1, name='Chris Froome', wins=3, weight=153.22),
@@ -331,8 +331,8 @@ def test_kudu_lookup_apply_default(sdc_builder, sdc_executor, cluster):
         tdf_contenders_table.create(engine)
         conn = engine.connect()
         conn.execute(tdf_contenders_table.insert(), [
-                {'rank': 1, 'name': None, 'wins': None},
-                {'rank': 2, 'name': None, 'wins': None}])
+            {'rank': 1, 'name': None, 'wins': None},
+            {'rank': 2, 'name': None, 'wins': None}])
 
         snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
         sdc_executor.stop_pipeline(pipeline)
@@ -705,8 +705,8 @@ def test_kudu_lookup_decimal_type(sdc_builder, sdc_executor, cluster):
     if not hasattr(cluster, 'kudu'):
         pytest.skip('Kudu tests only run against clusters with the Kudu service present.')
 
-    if not cluster.kudu.version >= '1.7.0':
-        pytest.skip('Test only designed to run on Kudu version >= 1.7.0')
+    if not Version(cluster.kudu.version) >= Version('1.7.0'):
+        pytest.skip(f'Test only designed to run on Kudu version >= 1.7.0, but found {cluster.kudu.version}')
 
     tour_de_france_contenders = [dict(rank=1, weight=150.58),
                                  dict(rank=2, weight=140.11)]
@@ -762,7 +762,7 @@ def test_kudu_lookup_decimal_type(sdc_builder, sdc_executor, cluster):
         sdc_executor.stop_pipeline(pipeline)
         i = 0
         for result in snapshot[kudu.instance_name].output:
-            assert result.field['weight'].value == tour_de_france_contenders[i]['weight']
+            assert result.field['weight'].value == round(Decimal(tour_de_france_contenders[i]['weight']), 2)
             i += 1
 
     finally:
@@ -878,7 +878,10 @@ def test_mapreduce_executor(sdc_builder, sdc_executor, cluster):
 def test_spark_executor(sdc_builder, sdc_executor, cluster):
     """Test Spark executor stage. This is acheived by using 2 pipelines. The 1st pipeline would generate the
     application resource file (Python in this case) which will be used by the 2nd pipeline for spark-submit. Spark
-    executor will do the spark-submit and we assert that it has submitted the job to Yarn. The pipelines would
+    executor will do the spark-submit and we assert that it has submitted the job to Yarn.
+    We will also verify that the job generates an event that contains the proper information.
+
+    The pipelines would
     look like:
 
         dev_raw_data_source >> local_fs >= pipeline_finisher_executor
@@ -886,6 +889,10 @@ def test_spark_executor(sdc_builder, sdc_executor, cluster):
         dev_raw_data_source >> record_deduplicator >> spark_executor
                                record_deduplicator >> trash
     """
+    # STF-1156: STF Does not properly configure Spark Executor for Secured Cluster
+    if cluster.hdfs.is_kerberized:
+        pytest.skip('Spark Executor tests on secured cluster are not supported.')
+
     python_data = 'print("Hello World!")'
     tmp_directory = '/tmp/out/{}'.format(get_random_string(string.ascii_letters, 10))
     python_suffix = 'py'
@@ -917,9 +924,9 @@ def test_spark_executor(sdc_builder, sdc_executor, cluster):
                                                                                   raw_data='dummy')
     record_deduplicator = builder.add_stage('Record Deduplicator')
     trash = builder.add_stage('Trash')
+    trash2 = builder.add_stage('Trash')
     spark_executor = builder.add_stage(name=SPARK_EXECUTOR_STAGE_NAME)
-    spark_executor.set_attributes(cluster_manager='YARN',
-                                  minimum_number_of_worker_nodes=1,
+    spark_executor.set_attributes(minimum_number_of_worker_nodes=1,
                                   maximum_number_of_worker_nodes=1,
                                   application_name=application_name,
                                   deploy_mode='CLUSTER',
@@ -928,13 +935,16 @@ def test_spark_executor(sdc_builder, sdc_executor, cluster):
                                   application_resource=file_path,
                                   language='PYTHON')
 
-    dev_raw_data_source >> record_deduplicator >> spark_executor
+    dev_raw_data_source >> record_deduplicator >> spark_executor >= trash2
     record_deduplicator >> trash
 
     pipeline = builder.build(title='Spark executor pipeline').configure_for_environment(cluster)
     sdc_executor.add_pipeline(pipeline)
-    sdc_executor.start_pipeline(pipeline).wait_for_pipeline_batch_count(1)
+    snapshot2 = sdc_executor.capture_snapshot(pipeline, start_pipeline=True, batches=1).snapshot
     sdc_executor.stop_pipeline(pipeline)
+
+    assert 'default user (sdc)' == snapshot2[spark_executor.instance_name].event_records[0].field['submitter'].value
+    assert snapshot2[spark_executor.instance_name].event_records[0].field['timestamp'].value
 
     # assert Spark executor has triggered the YARN job
     assert cluster.yarn.wait_for_app_to_register(application_name)

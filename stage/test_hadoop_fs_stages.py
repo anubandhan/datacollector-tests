@@ -308,6 +308,88 @@ def test_hadoop_fs_origin_standalone(sdc_builder, sdc_executor, cluster, filenam
 
 @sdc_min_version('3.2.0.0')
 @cluster('cdh', 'hdp')
+@pytest.mark.parametrize('action', ['ARCHIVE', 'DELETE'])
+@pytest.mark.parametrize('process_subdirs', [True, False])
+def test_hadoop_fs_origin_standalone_archive(sdc_builder, sdc_executor, cluster, action, process_subdirs):
+    """Test file post-processing functionality in Hadoop FS Standalone origin.
+
+    The test creates a directory tree and populates it with files. Then it checks the files are ingested by
+    the pipeline and post-processed accordingly (either removing the file from HDFS when 'DELETE' is
+    configured or moving the files to the archive directory when 'ARCHIVE' is configured).
+
+    Pipeline:  hdfs_origin >> trash
+
+    """
+    fs = cluster.hdfs.client
+
+    # Variable `files` defines the directory tree employed in the test. Keys are the directories and values
+    # are the list of files in each directory.
+    rootdir = os.path.join('/tmp', get_random_string(string.ascii_letters, 10))
+    archive_dir = os.path.join('/tmp', get_random_string(string.ascii_letters, 10))
+    files = {'.': [get_random_string() for _ in range(3)],
+             'a1': [get_random_string() for _ in range(3)],
+             'b1': [get_random_string() for _ in range(3)],
+             os.path.join('a1', 'a2'): [get_random_string() for _ in range(3)],
+             os.path.join('b1', 'b2'): [get_random_string() for _ in range(3)]}
+    num_files = sum([len(files[d]) for d in files]) if process_subdirs else len(files['.'])
+
+    # Create the directory tree according to `files`. The content of each file will be just the filename.
+    # Also generate the directory where files will be archived.
+    fs.makedirs(rootdir, permission='0777')  # Ensure sticky bit is disable to avoid permission issues.
+    fs.makedirs(archive_dir, permission='0777')
+    for (folder, filenames) in files.items():
+        if folder != '.':
+            fs.makedirs(os.path.join(rootdir, folder), permission='0777')
+        for f in filenames:
+            fs.write(os.path.join(rootdir, folder, f), data=f, permission='777')
+
+    # Build the pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    hdfs_origin = builder.add_stage('Hadoop FS Standalone', type='origin')
+    hdfs_origin.set_attributes(files_directory=rootdir,
+                               read_order='TIMESTAMP',
+                               file_name_pattern='*',
+                               process_subdirectories=process_subdirs,
+                               file_post_processing=action,
+                               archive_directory=archive_dir,
+                               data_format='TEXT')
+    trash = builder.add_stage('Trash')
+    hdfs_origin >> trash
+
+    try:
+        # Run the pipeline and wait until all the files were ingested.
+        pipeline = builder.build().configure_for_environment(cluster)
+        sdc_executor.add_pipeline(pipeline)
+        sdc_executor.start_pipeline(pipeline).wait_for_pipeline_output_records_count(num_files)
+        sdc_executor.stop_pipeline(pipeline)
+
+        # Check all the files were correctly post-processed. First, verify that all the files were removed
+        # from their original paths.
+        num_files = sum([len(files) for folder, __, files in fs.walk(rootdir)
+                         if (folder == rootdir or process_subdirs)])
+        assert num_files == 0
+
+        # Second, verify the files where moved to the archive dir when 'ARCHIVE' is configured.
+        if action == 'ARCHIVE':
+            archived_files = []
+            for folder, __, filenames in fs.walk(archive_dir):
+                archived_files.extend([os.path.join(folder, f) for f in filenames])
+
+            for folder, filenames in files.items():
+                if folder == '.' or process_subdirs:
+                    for f in filenames:
+                        expected_path = os.path.join(archive_dir, folder, f).replace('./', '')
+                        assert expected_path in archived_files
+                        with fs.read(expected_path) as reader:
+                            assert reader.read() == f.encode()
+
+    finally:
+        fs.delete(rootdir, recursive=True)
+        fs.delete(archive_dir, recursive=True)
+
+
+@sdc_min_version('3.2.0.0')
+@cluster('cdh', 'hdp')
 @pytest.mark.parametrize('filename', ['file.txt', '_tmp_file.txt', '.tmp_file.txt'])
 def test_hadoop_fs_origin_standalone_subdirectories(sdc_builder, sdc_executor, cluster, filename):
     """Write a simple file into each level of a Hadoop FS folder hierarchy, with randomly-generated names
@@ -504,7 +586,7 @@ def test_hadoop_fs_origin_standalone_multi_thread(sdc_builder, sdc_executor, clu
         output_records_count = history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count
 
         assert input_records_count == hdfs_lines_per_file * hdfs_files_count
-        assert output_records_count == hdfs_lines_per_file * hdfs_files_count + hdfs_number_of_threads
+        assert output_records_count == hdfs_lines_per_file * hdfs_files_count + 1  # output + no more data event
     finally:
         cluster.hdfs.client.delete(hadoop_fs_folder, recursive=True)
 
@@ -579,6 +661,7 @@ def test_kerberos_ticket_expiration_hadoop_fs_destination(sdc_builder, sdc_execu
         # remove HDFS files
         logger.info('Deleting Hadoop FS directory %s ...', hdfs_directory)
         cluster.hdfs.client.delete(hdfs_directory, recursive=True)
+
 
 @sdc_min_version('3.0.0')
 @cluster('cdh', 'hdp')
@@ -658,3 +741,65 @@ def test_hadoop_fs_destination_sequence_files(sdc_builder, sdc_executor, cluster
     finally:
         logger.info('Deleting Hadoop FS directory %s ...', hdfs_directory)
         cluster.hdfs.client.delete(hdfs_directory, recursive=True)
+
+
+@cluster('cdh', 'hdp')
+@pytest.mark.parametrize('read_order', ['LEXICOGRAPHICAL', 'TIMESTAMP'])
+@sdc_min_version('3.2.0.0')
+def test_hadoop_fs_origin_standalone_simple_ordering(sdc_builder, sdc_executor, cluster, read_order):
+    """Write files into a Hadoop FS folder with a randomly-generated name and confirm that the Hadoop FS origin
+    successfully reads the expected number of records, for both lexicographical and timestamp ordering.
+    Specifically, this would look like:
+
+    Hadoop FS pipeline:
+        hadoop_fs_origin >> trash
+        hadoop_fs_origin >= finisher
+    """
+    hadoop_fs_folder = '/tmp/out/{}'.format(get_random_string(string.ascii_letters, 10))
+    filename = 'filename.txt'
+    number_of_files = 3
+    records_per_file = 1000
+
+    # Build the Hadoop FS pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    hadoop_fs = builder.add_stage('Hadoop FS Standalone', type='origin')
+    hadoop_fs.set_attributes(data_format='TEXT', files_directory=hadoop_fs_folder,
+                             file_name_pattern='*', read_order=read_order)
+
+    trash = builder.add_stage('Trash')
+
+    finisher = builder.add_stage('Pipeline Finisher Executor')
+    finisher.set_attributes(stage_record_preconditions=["${record:eventType() == 'no-more-data'}"])
+
+    hadoop_fs >> trash
+    hadoop_fs >= finisher
+
+    hadoop_fs_pipeline = builder.build(title='Hadoop FS pipeline').configure_for_environment(cluster)
+    hadoop_fs_pipeline.configuration['shouldRetry'] = False
+
+    sdc_executor.add_pipeline(hadoop_fs_pipeline)
+
+    try:
+        lines_in_file = [f'Message {i}' for i in range(records_per_file)]
+
+        # Create files in hdfs
+        logger.debug('Writing file %s/file.txt to Hadoop FS ...', hadoop_fs_folder)
+        cluster.hdfs.client.makedirs(hadoop_fs_folder)
+        for i in range(number_of_files):
+            cluster.hdfs.client.write(os.path.join(hadoop_fs_folder, f'{filename}_{i}'), data='\n'.join(lines_in_file))
+
+        # Run the pipeline until there is no more data
+        sdc_executor.start_pipeline(hadoop_fs_pipeline).wait_for_finished(timeout_sec=180)
+
+        # Check history and assert all data has been read
+        history = sdc_executor.get_pipeline_history(hadoop_fs_pipeline)
+        input_records_count = history.latest.metrics.counter('pipeline.batchInputRecords.counter').count
+        output_records_count = history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count
+
+        assert input_records_count == number_of_files * records_per_file
+        assert output_records_count == number_of_files * records_per_file + 1
+
+    finally:
+        cluster.hdfs.client.delete(hadoop_fs_folder, recursive=True)

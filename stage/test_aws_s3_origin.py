@@ -14,16 +14,18 @@
 import io
 import json
 import logging
-import os
 import string
 import tempfile
 import time
 from zipfile import ZipFile
+import xml.etree.ElementTree as ET
 
 import pytest
-from streamsets.testframework.markers import aws, sdc_min_version
+from streamsets.testframework.markers import aws, sdc_min_version, large
 from streamsets.testframework.utils import get_random_string
 from xlwt import Workbook
+
+from .utils.utils_aws import allow_public_access, restore_public_access
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +36,83 @@ DEFAULT_DATA_FORMAT = 'JSON'
 SINGLETHREADED = 1
 MULTITHREADED = 5
 DEFAULT_NUMBER_OF_RECORDS = 5
-
+DATACOLLECTOR_TEST_FILES_BUCKET = 'datacollector-test-files'
 
 @pytest.fixture(scope='module')
 def sdc_common_hook():
     def hook(data_collector):
         data_collector.add_stage_lib('streamsets-datacollector-jython_2_7-lib')
-
+        data_collector.sdc_properties['production.maxBatchSize'] = '100000'
     return hook
+
+
+@aws('s3')
+def test_s3_origin_empty_origin_stop_when_nomoredata_received(sdc_builder, sdc_executor, aws):
+    """Test that an empty origin linked to a Pipeline Finisher Executor which ends the pipeline when
+    a no-more-data is received actually emits this event.
+
+    The pipeline looks like:
+        s3_origin >> trash
+        s3_origin >= pipeline_finisher_executor
+    """
+    s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/sdc'
+
+    # Build the pipeline
+    builder = sdc_builder.get_pipeline_builder()
+    # Just discard errors, we are not interested on them here
+    builder.add_error_stage('Discard')
+
+    # Declare and configure parts of the pipeline
+    s3_origin = builder.add_stage('Amazon S3', type = 'origin')
+
+    s3_origin.set_attributes(bucket=aws.s3_bucket_name, data_format=DEFAULT_DATA_FORMAT,
+                             prefix_pattern=f'{s3_key}/*', number_of_threads=MULTITHREADED,
+                             read_order=DEFAULT_READ_ORDER)
+
+    trash = builder.add_stage('Trash')
+
+    # Pipeline Finisher Executor, note the precondition
+    pipeline_finished_executor = builder.add_stage('Pipeline Finisher Executor')
+    pipeline_finished_executor.set_attributes(stage_record_preconditions=["${record:eventType() == 'no-more-data'}"])
+
+    # Implement pipeline topology
+    s3_origin >> trash
+    s3_origin >= pipeline_finished_executor
+
+    s3_origin_pipeline = builder.build(title='Amazon S3 origin multithreaded pipeline no data no more data event').\
+        configure_for_environment(aws)
+    # This is not supposed to fail under any context
+    s3_origin_pipeline.configuration['shouldRetry'] = False
+
+    # Add built pipeline to the DC executor
+    sdc_executor.add_pipeline(s3_origin_pipeline)
+
+    try:
+        # Run the pipeline
+        # Do not continue until the pipeline finishes
+        snapshot = sdc_executor.capture_snapshot(s3_origin_pipeline, start_pipeline = True).snapshot
+        sdc_executor.get_pipeline_status(s3_origin_pipeline).wait_for_status(status = 'FINISHED', timeout_sec = 60)
+        history = sdc_executor.get_pipeline_history(s3_origin_pipeline)
+        # If we are here this means that a no-more-data was sent
+
+        # Check that the number of records is correct
+        input_records = history.latest.metrics.counter('pipeline.batchInputRecords.counter').count
+        output_records = history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count
+        assert input_records == 0, 'Observed %d input records (expected 0)' % input_records
+        assert output_records == 1, 'Observed %d output records (expected 1)' % output_records
+
+        # We have exactly one output record, check that it is a no-more-data event
+        num_event_records = len(snapshot[s3_origin.instance_name].event_records)
+        assert num_event_records == 1, 'Received %d event records (expected 1)' % num_event_records
+        event_record = snapshot[s3_origin.instance_name].event_records[0]
+        event_type = event_record.header.values['sdc.event.type']
+        assert event_type == 'no-more-data', 'Received %s as event type (expected no-more-data)' % event_type
+
+    finally:
+        if sdc_executor.get_pipeline_status(s3_origin_pipeline).response.json().get('status') == 'RUNNING':
+            logger.info('Stopping pipeline')
+            sdc_executor.stop_pipeline(s3_origin_pipeline)
+            raise AssertionError('Pipeline was still running after 60s')
 
 
 @aws('s3')
@@ -160,7 +231,29 @@ def test_s3_origin_multithreaded(sdc_builder, sdc_executor, aws):
     base_s3_origin(sdc_builder, sdc_executor, aws, DEFAULT_READ_ORDER, DEFAULT_DATA_FORMAT, 10, 50)
 
 
-def base_s3_origin(sdc_builder, sdc_executor, aws, read_order, data_format, number_of_threads, number_of_records):
+@aws('s3')
+def test_s3_origin_anonymous(sdc_builder, sdc_executor, aws):
+    """Tests accessing a public object where we can list bucket contents."""
+    base_s3_origin(sdc_builder, sdc_executor, aws, DEFAULT_READ_ORDER, DEFAULT_DATA_FORMAT, SINGLETHREADED,
+                   DEFAULT_NUMBER_OF_RECORDS, anonymous=True)
+
+
+@aws('s3')
+def test_s3_origin_anonymous_no_list(sdc_builder, sdc_executor, aws):
+    """Tests accessing a public object where we cannot list bucket contents."""
+    base_s3_origin(sdc_builder, sdc_executor, aws, DEFAULT_READ_ORDER, DEFAULT_DATA_FORMAT, SINGLETHREADED,
+                   1, anonymous=True, allow_list=False)
+
+@aws('s3')
+@sdc_min_version('3.16.0')
+@pytest.mark.parametrize('use_path_style_address_model', [True, False])
+def test_s3_origin_use_path_style_address_model(sdc_builder, sdc_executor, aws, use_path_style_address_model):
+    base_s3_origin(sdc_builder, sdc_executor, aws, DEFAULT_READ_ORDER, DEFAULT_DATA_FORMAT, SINGLETHREADED,
+                   1, use_path_style_address_model=use_path_style_address_model)
+
+
+def base_s3_origin(sdc_builder, sdc_executor, aws, read_order, data_format, number_of_threads, number_of_records,
+                   anonymous=False, allow_list=True, use_path_style_address_model=None):
     """Basic setup for amazon S3Origin tests. It receives different variables indicating the read order, data format...
     In order to parametrize all this configuration properties and make tests simpler.
     The pipeline looks like:
@@ -182,8 +275,16 @@ def base_s3_origin(sdc_builder, sdc_executor, aws, read_order, data_format, numb
 
     s3_origin = builder.add_stage('Amazon S3', type='origin')
 
-    s3_origin.set_attributes(bucket=s3_bucket, data_format=data_format, prefix_pattern=f'{s3_key}/*',
-                             number_of_threads=number_of_threads, read_order=read_order)
+    s3_origin.set_attributes(bucket=s3_bucket,
+                             data_format=data_format,
+                             prefix_pattern=f'{s3_key}/*' if allow_list else f'{s3_key}/0',
+                             number_of_threads=number_of_threads,
+                             read_order=read_order)
+
+    # Since Use Path Style Addess Model doesn't exist in all versions, we set it conditionally only if it should
+    # have some real value.
+    if use_path_style_address_model is not None:
+        s3_origin.use_path_style_address_model = use_path_style_address_model
 
     trash = builder.add_stage('Trash')
 
@@ -200,13 +301,23 @@ def base_s3_origin(sdc_builder, sdc_executor, aws, read_order, data_format, numb
     s3_origin_pipeline = builder.build(title=pipeline_name).configure_for_environment(aws)
     s3_origin_pipeline.configuration['shouldRetry'] = False
 
+    if anonymous:
+        s3_origin.set_attributes(access_key_id='', secret_access_key='')
+
     sdc_executor.add_pipeline(s3_origin_pipeline)
 
     client = aws.s3
+    public_access_block = None
+    bucket_policy = None
     try:
+        acl = 'public-read' if anonymous else 'private'
+
+        if anonymous:
+            public_access_block, bucket_policy = allow_public_access(client, s3_bucket, allow_list, False)
+
         # Insert objects into S3.
         for i in range(s3_obj_count):
-            client.put_object(Bucket=s3_bucket, Key=f'{s3_key}/{i}', Body=json.dumps(json_data))
+            client.put_object(Bucket=s3_bucket, Key=f'{s3_key}/{i}', Body=json.dumps(json_data), ACL=acl)
 
         if number_of_threads == SINGLETHREADED:
             # Snapshot the pipeline and compare the records.
@@ -228,11 +339,15 @@ def base_s3_origin(sdc_builder, sdc_executor, aws, read_order, data_format, numb
             assert history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count == s3_obj_count + 1
 
     finally:
+        restore_public_access(client, s3_bucket, public_access_block, bucket_policy)
         if number_of_records > 0:
             # Clean up S3.
-            delete_keys = {'Objects': [{'Key': k['Key']}
-                                       for k in
-                                       client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_key)['Contents']]}
+            if number_of_records > 1:
+                delete_keys = {'Objects': [{'Key': k['Key']}
+                                           for k in
+                                           client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_key)['Contents']]}
+            else:
+                delete_keys = {'Objects': [{'Key' : f'{s3_key}/0'}]}
             client.delete_objects(Bucket=s3_bucket, Delete=delete_keys)
 
 
@@ -350,14 +465,14 @@ def test_invalid_configs_diff_bucket_same_prefix(sdc_builder, sdc_executor, aws)
     s3_origin.set_attributes(bucket=aws.s3_bucket_name, common_prefix=prefix, error_handling_option='ARCHIVE',
                              archiving_option='MOVE_TO_BUCKET', error_prefix=prefix, error_bucket=aws.s3_bucket_name,
                              post_processing_option='ARCHIVE', post_process_prefix=prefix,
-                             post_process_bucket='post-process-bucket', data_format=DEFAULT_DATA_FORMAT,
+                             post_process_bucket='post-process-bucket-qwertyuiopasdfhklhkjlzxcv', data_format=DEFAULT_DATA_FORMAT,
                              prefix_pattern=f'{s3_key}*')
 
     trash = builder.add_stage('Trash')
 
     s3_origin >> trash
 
-    s3_origin_pipeline = builder.build(title='Amazon S3 configs  pipeline').configure_for_environment(aws)
+    s3_origin_pipeline = builder.build().configure_for_environment(aws)
 
     s3_origin_pipeline.configuration['shouldRetry'] = False
     sdc_executor.add_pipeline(s3_origin_pipeline)
@@ -460,9 +575,10 @@ def test_s3_event_finisher_multiple_events(sdc_builder, sdc_executor, aws):
     """
     s3_bucket = aws.s3_bucket_name
     s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/sdc'
+    records_per_file = 10
 
-    data = [dict(f1=get_random_string(), f2=get_random_string()) for _ in range(10)]
-    data2 = [dict(f1=get_random_string(), f2=get_random_string()) for _ in range(10)]
+    data = [dict(f1=get_random_string(), f2=get_random_string()) for _ in range(records_per_file)]
+    data2 = [dict(f1=get_random_string(), f2=get_random_string()) for _ in range(records_per_file)]
 
     s3_obj_count = 1
 
@@ -482,7 +598,8 @@ def test_s3_event_finisher_multiple_events(sdc_builder, sdc_executor, aws):
     jython_evaluator.set_attributes(init_script="state['record-count'] = 0", script="""
 for record in records:
     output.write(record)
-    state['record-count'] = state['record-count'] + 1
+    if (record.attributes['sdc.event.type'] == 'no-more-data'):
+        state['record-count'] = state['record-count'] + 1
 
 if (state['record-count'] >= 2):
     event = sdcFunctions.createEvent('stop-pipeline', 1)
@@ -504,26 +621,23 @@ if (state['record-count'] >= 2):
 
     client = aws.s3
     try:
-        # Insert objects into S3.
+        # Insert objects into S3, process them and add an additional file
         client.put_object(Bucket=s3_bucket, Key=f'{s3_key}{s3_obj_count}-1', Body=json.dumps(data))
-
         sdc_executor.start_pipeline(s3_origin_pipeline).wait_for_pipeline_output_records_count(10, timeout_sec=300)
-
         client.put_object(Bucket=s3_bucket, Key=f'{s3_key}{s3_obj_count}-2', Body=json.dumps(data2))
 
+        # Take snapshot and check output records
         snapshot = sdc_executor.capture_snapshot(s3_origin_pipeline).snapshot
-
         output_records_values = [record.field for record in snapshot[s3_origin.instance_name].output]
-
-        assert len(output_records_values) == s3_obj_count * 10
+        assert len(output_records_values) == s3_obj_count * records_per_file
         assert output_records_values == data2
 
         sdc_executor.get_pipeline_status(s3_origin_pipeline).wait_for_status(status='FINISHED', timeout_sec=300)
 
+        # Check that the origin has produced the expected records
         history = sdc_executor.get_pipeline_history(s3_origin_pipeline)
-        assert history.latest.metrics.counter('pipeline.batchInputRecords.counter').count == 2 * 10
-        # We have 2 events and we are generating a third one to effectively stop the pipeline
-        assert history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count == 2 * (10 + 1) + 1
+        output_count = history.latest.metrics.counter(f'stage.{s3_origin.instance_name}.outputRecords.counter').count
+        assert 2 * records_per_file == output_count
 
     finally:
         if sdc_executor.get_pipeline_status(s3_origin_pipeline).response.json().get('status') == 'RUNNING':
@@ -917,7 +1031,7 @@ def test_s3_origin_timestamp_last_file_offset(sdc_builder, sdc_executor, aws, re
 
         # Verify read data
         history = sdc_executor.get_pipeline_history(s3_origin_pipeline)
-        assert history.latest.metrics.counter('pipeline.batchInputRecords.counter').count == records_per_file*2
+        assert history.latest.metrics.counter('pipeline.batchInputRecords.counter').count == records_per_file * 2
 
         # Start pipeline again, wait some time and assert that no duplicated data has been read
         sdc_executor.start_pipeline(s3_origin_pipeline).wait_for_finished(timeout_sec=30)
@@ -940,7 +1054,6 @@ def test_s3_origin_timestamp_last_file_offset(sdc_builder, sdc_executor, aws, re
 @aws('s3')
 @pytest.mark.parametrize('read_order', ['LEXICOGRAPHICAL', 'TIMESTAMP'])
 def test_s3_restart_with_file_offset(sdc_builder, sdc_executor, aws, read_order):
-
     s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/sdc'
     records_per_file = 100_000
 
@@ -1002,6 +1115,7 @@ def test_s3_restart_with_file_offset(sdc_builder, sdc_executor, aws, read_order)
                                    for k in
                                    client.list_objects_v2(Bucket=aws.s3_bucket_name, Prefix=s3_key)['Contents']]}
         client.delete_objects(Bucket=aws.s3_bucket_name, Delete=delete_keys)
+
 
 # SDC-11925: Allow specifying subset of sheets to import when reading Excel files
 @aws('s3')
@@ -1130,6 +1244,7 @@ def test_s3_excel_skip_cells_missing_header(sdc_builder, sdc_executor, aws, skip
                                    for k in client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_key)['Contents']]}
         client.delete_objects(Bucket=s3_bucket, Delete=delete_keys)
 
+
 # SDC-11924: Better handling of various error header states in Excel parser
 @aws('s3')
 @sdc_min_version('3.10.0')
@@ -1186,3 +1301,281 @@ def test_s3_excel_parsing_incomplete_header(sdc_builder, sdc_executor, aws):
         delete_keys = {'Objects': [{'Key': k['Key']}
                                    for k in client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_key)['Contents']]}
         client.delete_objects(Bucket=s3_bucket, Delete=delete_keys)
+
+
+@aws('s3')
+@sdc_min_version('3.11.0')
+def test_s3_origin_events(sdc_builder, sdc_executor, aws):
+    """Test simple scenario of generating events:
+        - a new-file event when starting to read a new file, containing the filepath
+        - a finished-file event once the pipeline is finished, containing the filepath, record count and error count
+        - a no-more-data event when there are no more files to process
+
+    The pipeline has 2 finishers, one for finished-file and one for no-more-data events. When we first run the pipeline
+    it will stop once the finished-file event is generated, having read the totality of the file. When we run the
+    pipeline a second time, it will try to grab a non-existing next file and generate the no-more-data event.
+
+    The pipeline looks like:
+    s3 origin >> trash
+    s3 origin >= [pipeline finisher executor, pipeline finisher executor]
+    """
+    s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}'
+    records_per_file = 3
+    batch_size = 10
+    data_file = 'data-file.txt'
+    test_data = [f'Message {i}' for i in range(records_per_file)]
+
+    # Build pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    origin = builder.add_stage('Amazon S3', type='origin')
+    origin.set_attributes(bucket=aws.s3_bucket_name, data_format='TEXT',
+                          prefix_pattern=f'{s3_key}/*',
+                          max_batch_size_in_records=batch_size)
+
+    target = builder.add_stage('Trash')
+
+    file_finished_finisher = builder.add_stage('Pipeline Finisher Executor')
+    file_finished_finisher.set_attributes(stage_record_preconditions=["${record:eventType() == 'finished-file'}"])
+
+    no_more_data_finisher = builder.add_stage('Pipeline Finisher Executor')
+    no_more_data_finisher.set_attributes(stage_record_preconditions=["${record:eventType() == 'no-more-data'}"])
+
+    origin >> target
+    origin >= [file_finished_finisher, no_more_data_finisher]
+
+    pipeline = builder.build().configure_for_environment(aws)
+    pipeline.configuration['shouldRetry'] = False
+    sdc_executor.add_pipeline(pipeline)
+
+    client = aws.s3
+    try:
+        # Insert objects into S3.
+        client.put_object(Bucket=aws.s3_bucket_name, Key=f'{s3_key}/{data_file}',
+                          Body='\n'.join(test_data).encode('ascii'))
+
+        # Run until finished-file
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True, batch_size=batch_size).snapshot
+        output_records = snapshot[origin.instance_name].output
+        event_records = snapshot[origin.instance_name].event_records
+
+        # Assert that 3 records have been read and 2 events have been generated
+        assert 3 == len(output_records)
+        assert 2 == len(event_records)
+
+        # Assert that first event is of type new-file and contains the correct filepath
+        assert 'new-file' == event_records[0].header['values']['sdc.event.type']
+        assert f'{s3_key}/{data_file}' == event_records[0].field['filepath']
+
+        # Assert that second event is of type finished-file and contains the correct filepath, recordCount & errorCount
+        assert 'finished-file' == event_records[1].header['values']['sdc.event.type']
+        assert f'{s3_key}/{data_file}' == event_records[1].field['filepath']
+        assert 3 == event_records[1].field['record-count']
+        assert 0 == event_records[1].field['error-count']
+
+        # Restart pipeline to generate no more data event
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True, batch_size=batch_size).snapshot
+        event_records = snapshot[origin.instance_name].event_records
+        assert 'no-more-data' == event_records[0].header['values']['sdc.event.type']
+
+    finally:
+        delete_keys = {'Objects': [{'Key': k['Key']}
+                                   for k in
+                                   client.list_objects_v2(Bucket=aws.s3_bucket_name, Prefix=s3_key)['Contents']]}
+        client.delete_objects(Bucket=aws.s3_bucket_name, Delete=delete_keys)
+
+@aws('s3')
+@large
+def test_s3_read_large_file(sdc_builder, sdc_executor, aws):
+    """This is a test for reading a large file (>2GB) from S3 in CSV format and test the fix for SDC-12774
+        1. Create and run a pipeline from S3 origin to Trash
+        2. Read the specified CSV file
+        3. Check the results (number of record in the file vs number of records read).
+    """
+    FILE_NAME = 'large-file-test-sdc-12774.csv'
+    NUMBER_OF_RECORDS_IN_THE_FILE = 300_000_000
+
+    builder = sdc_builder.get_pipeline_builder()
+
+    # Since we will be a reading a large file, set the batch size to 100,000
+    s3_origin = builder.add_stage('Amazon S3', type='origin')
+    s3_origin.set_attributes(bucket=DATACOLLECTOR_TEST_FILES_BUCKET, data_format='DELIMITED',
+                             delimiter_format_type='CSV',
+                             prefix_pattern=FILE_NAME,
+                             max_batch_size_in_records=100_000)
+
+    trash = builder.add_stage('Trash')
+
+    pipeline_finisher = builder.add_stage('Pipeline Finisher Executor')
+    pipeline_finisher.set_attributes(stage_record_preconditions=["${record:eventType() == 'no-more-data'}"])
+
+    s3_origin >> trash
+    s3_origin >= [pipeline_finisher]
+
+    pipeline = builder.build().configure_for_environment(aws)
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        # The file that is being read is large. Set the timeout to 1 hour
+        sdc_executor.start_pipeline(pipeline).wait_for_finished(timeout_sec=3600)
+
+        history = sdc_executor.get_pipeline_history(pipeline)
+        input_records = history.latest.metrics.counter('pipeline.batchInputRecords.counter').count
+
+        assert input_records == NUMBER_OF_RECORDS_IN_THE_FILE
+
+    finally:
+        if sdc_executor.get_pipeline_status(pipeline).response.json().get('status') == 'RUNNING':
+            sdc_executor.stop_pipeline(pipeline)
+
+
+@aws('s3')
+@pytest.mark.parametrize('read_order', ['LEXICOGRAPHICAL', 'TIMESTAMP'])
+def test_s3_restart_with_file_offset_and_xml_data_format(sdc_builder, sdc_executor, aws, read_order):
+    """ This test is for xml data format, which was not working properly when reset with file offset.
+        It checks that no stage error happens after the pipeline is restarted with an offset halfway in the file.
+        Snapshot pipeline:
+            s3_origin >> trash
+    """
+    s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/sdc'
+    records_in_file = 10_000
+
+    # Create test data files
+    data_file_filename = 'xml-file.xml'
+    xml_root = ET.Element('root')
+    records = ET.SubElement(xml_root, 'records')
+    for i in range(records_in_file):
+        record = ET.SubElement(records, 'record')
+        record_id = ET.SubElement(record, 'id')
+        record_id.text = str(i)
+        name = ET.SubElement(record, 'name')
+        name.text = f'record-{i}'
+    test_data = ET.tostring(xml_root)
+
+    # Build pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    s3_origin = builder.add_stage('Amazon S3', type='origin')
+    s3_origin.set_attributes(bucket=aws.s3_bucket_name, data_format='XML',
+                             delimiter_element='/root/records/record',
+                             prefix_pattern=f'{s3_key}/*.xml',
+                             read_order=read_order,
+                             max_batch_size_in_records=10)
+    trash = builder.add_stage('Trash')
+
+    s3_origin >> trash
+
+    s3_origin_pipeline = builder.build(title='Amazon S3 origin restart pipeline with XML data format')\
+        .configure_for_environment(aws)
+    s3_origin_pipeline.configuration['shouldRetry'] = False
+    sdc_executor.add_pipeline(s3_origin_pipeline)
+
+    client = aws.s3
+    try:
+        # Insert objects into S3.
+        client.put_object(Bucket=aws.s3_bucket_name, Key=f'{s3_key}/{data_file_filename}',
+                          Body=test_data)
+
+        # Read 2 batches & stop the pipeline halfway through the file
+        sdc_executor.start_pipeline(s3_origin_pipeline).wait_for_pipeline_batch_count(2)
+        sdc_executor.stop_pipeline(s3_origin_pipeline)
+
+        history = sdc_executor.get_pipeline_history(s3_origin_pipeline)
+        input_records = history.latest.metrics.counter('pipeline.batchInputRecords.counter').count
+
+        # Restart the pipeline and wait until it reads all data
+        sdc_executor.start_pipeline(s3_origin_pipeline)\
+            .wait_for_pipeline_batch_count((records_in_file - input_records)/10)
+
+        # Assert no stage errors have happened
+        assert 0 == len(sdc_executor.get_stage_errors(s3_origin_pipeline, s3_origin))
+
+    finally:
+        # If no files have been processed we need to stop the pipeline, otherwise it will be finished
+        try:
+            if sdc_executor.get_pipeline_status(s3_origin_pipeline).response.json().get('status') == 'RUNNING':
+                sdc_executor.stop_pipeline(s3_origin_pipeline, force=True)
+        finally:
+            # Clean up S3.
+            delete_keys = {'Objects': [{'Key': k['Key']}
+                                       for k in
+                                       client.list_objects_v2(Bucket=aws.s3_bucket_name, Prefix=s3_key)['Contents']]}
+            client.delete_objects(Bucket=aws.s3_bucket_name, Delete=delete_keys)
+
+
+@aws('s3')
+@pytest.mark.parametrize('read_order', ['LEXICOGRAPHICAL', 'TIMESTAMP'])
+def test_s3_restart_pipeline_with_changed_common_prefix(sdc_builder, sdc_executor, aws, read_order):
+    """ This test is for xml data format, which was not working properly when reset with file offset.
+        It checks that no stage error happens after the pipeline is restarted with an offset halfway in the file.
+        Snapshot pipeline:
+            s3_origin >> trash
+    """
+    s3_key = f'{S3_SANDBOX_PREFIX}/{get_random_string()}/sdc'
+    n_files = 200
+    records_in_file = 1000
+
+    # Create test data files
+    data_file_filename = 'file.txt'
+    records = [f'Record {i}' for i in range(records_in_file)]
+
+    # Build pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    s3_origin = builder.add_stage('Amazon S3', type='origin')
+    s3_origin.set_attributes(bucket=aws.s3_bucket_name, data_format='TEXT',
+                             delimiter_element='/root/records/record',
+                             prefix_pattern=f'{s3_key}/*.txt',
+                             read_order=read_order,
+                             max_batch_size_in_records=100)
+
+    trash = builder.add_stage('Trash')
+
+    pipeline_finished_executor = builder.add_stage('Pipeline Finisher Executor')
+    pipeline_finished_executor.set_attributes(stage_record_preconditions=["${record:eventType() == 'no-more-data'}"])
+
+    s3_origin >> trash
+    s3_origin >= pipeline_finished_executor
+
+    s3_origin_pipeline = builder.build(title='Amazon S3 origin restart pipeline with XML data format') \
+        .configure_for_environment(aws)
+    s3_origin_pipeline.configuration['shouldRetry'] = False
+    sdc_executor.add_pipeline(s3_origin_pipeline)
+
+    client = aws.s3
+    try:
+        # Insert objects into S3.
+        for i in range(n_files):
+            client.put_object(Bucket=aws.s3_bucket_name, Key=f'{s3_key}/{data_file_filename}',
+                              Body='\n'.join(records).encode('ascii'))
+
+        # Read 10 batches & stop the pipeline
+        sdc_executor.start_pipeline(s3_origin_pipeline).wait_for_pipeline_batch_count(10)
+        sdc_executor.stop_pipeline(s3_origin_pipeline)
+
+        # Update prefix_pattern so that no file is found
+        s3_origin.set_attributes(delimiter_element=f'{s3_key}/*.xml')
+        sdc_executor.update_pipeline(s3_origin_pipeline)
+
+        # Restart the pipeline and wait until it reads all data
+        sdc_executor.start_pipeline(s3_origin_pipeline).wait_for_finished()
+
+        # Check no input records were found
+        history = sdc_executor.get_pipeline_history(s3_origin_pipeline)
+        num_input_records = history.latest.metrics.counter('pipeline.batchInputRecords.counter').count
+
+        assert 0 == num_input_records
+
+    finally:
+        # If no files have been processed we need to stop the pipeline, otherwise it will be finished
+        if sdc_executor.get_pipeline_status(s3_origin_pipeline).response.json().get('status') == 'RUNNING':
+            sdc_executor.stop_pipeline(s3_origin_pipeline, force=True)
+        # Clean up S3.
+        delete_keys = {'Objects': [{'Key': k['Key']}
+                                   for k in
+                                   client.list_objects_v2(Bucket=aws.s3_bucket_name, Prefix=s3_key)[
+                                       'Contents']]}
+        client.delete_objects(Bucket=aws.s3_bucket_name, Delete=delete_keys)

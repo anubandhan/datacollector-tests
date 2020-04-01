@@ -35,54 +35,6 @@ def version_check(sdc_builder, cluster):
 
 
 @cluster('cdh', 'hdp')
-def test_hbase_destination(sdc_builder, sdc_executor, cluster):
-    """Simple HBase destination test.
-    dev_raw_data_source >> hbase
-    """
-
-    # Create dummy data.
-    dumb_haiku = ['I see you driving', 'Round town with the girl I love', 'And I am like haiku.']
-
-    # Create random table name to avoid collisions.
-    random_table_name = get_random_string(string.ascii_letters, 10)
-
-    pipeline_builder = sdc_builder.get_pipeline_builder()
-
-    # Add Dev Raw Data Source stage to pipeline.
-    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
-    dev_raw_data_source.data_format = 'TEXT'
-    dev_raw_data_source.raw_data = '\n'.join(dumb_haiku)
-
-    # Add HBase stage to pipeline.
-    hbase = pipeline_builder.add_stage('HBase', type='destination')
-    hbase.table_name = random_table_name
-    hbase.row_key = '/text'
-    hbase.fields = [dict(columnValue='/text', columnStorageType='TEXT', columnName='cf1:cq1')]
-
-    # Build pipeline.
-    dev_raw_data_source >> hbase
-    pipeline = pipeline_builder.build().configure_for_environment(cluster)
-    pipeline.configuration['shouldRetry'] = False
-    sdc_executor.add_pipeline(pipeline)
-
-    try:
-        # Create table.
-        logger.info('Creating HBase table %s ...', random_table_name)
-        cluster.hbase.client.create_table(name=random_table_name, families={'cf1': {}})
-
-        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
-        sdc_executor.stop_pipeline(pipeline)
-
-        assert [record.field['text']
-                for record in snapshot[dev_raw_data_source.instance_name].output] == dumb_haiku
-    finally:
-        # Delete table.
-
-        logger.info('Deleting HBase table %s ...', random_table_name)
-        cluster.hbase.client.delete_table(name=random_table_name, disable=True)
-
-
-@cluster('cdh', 'hdp')
 def test_hbase_destination_validate_no_config_issues(sdc_builder, sdc_executor, cluster):
     """Simple HBase destination pipeline validation test.
     dev_raw_data_source >> hbase
@@ -304,7 +256,6 @@ def test_hbase_implicit_field_mapping_null(sdc_builder, sdc_executor, cluster):
                     dict(columnValue='/cf:d', columnStorageType='TEXT', columnName='cf:d')]
     hbase.set_attributes(on_record_error='DISCARD',
                          implicit_field_mapping=True,
-                         ignore_missing_field_path=True,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -354,8 +305,7 @@ def test_hbase_field_mapping(sdc_builder, sdc_executor, cluster):
     hbase.table_name = random_table_name
     hbase.row_key = '/text'
     hbase.fields = [dict(columnValue='/cf:a', columnStorageType='TEXT', columnName='cf:a')]
-    hbase.set_attributes(implicit_field_mapping=True,
-                         ignore_missing_field_path=False)
+    hbase.set_attributes(implicit_field_mapping=True)
 
     # Build pipeline.
     dev_raw_data_source >> hbase
@@ -412,7 +362,6 @@ def test_hbase_field_mapping_ignore_invalid_column(sdc_builder, sdc_executor, cl
                     dict(columnValue='/cf:b', columnStorageType='TEXT', columnName='cf:b')]
     hbase.set_attributes(on_record_error='DISCARD',
                          implicit_field_mapping=True,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=True)
 
     # Build pipeline.
@@ -466,7 +415,6 @@ def test_hbase_field_mapping_not_ignore_invalid_column(sdc_builder, sdc_executor
                     dict(columnValue='/cf:b', columnStorageType='TEXT', columnName='cf:b')]
     hbase.set_attributes(on_record_error='TO_ERROR',
                          implicit_field_mapping=True,
-                         ignore_missing_field_path=True,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -529,7 +477,6 @@ def test_hbase_write_wrong_column(sdc_builder, sdc_executor, cluster):
     hbase.set_attributes(storage_type='TEXT',
                          on_record_error='TO_ERROR',
                          implicit_field_mapping=True,
-                         ignore_missing_field_path=True,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -589,7 +536,6 @@ def test_hbase_invalid_row_key(sdc_builder, sdc_executor, cluster):
     hbase.fields = [dict(columnValue='[1]', columnStorageType='TEXT', columnName='cf:a')]
     hbase.set_attributes(on_record_error='TO_ERROR',
                          implicit_field_mapping=True,
-                         ignore_missing_field_path=True,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -647,7 +593,6 @@ def test_hbase_not_flat_map(sdc_builder, sdc_executor, cluster):
     hbase.fields = [dict(columnValue='[1]', columnStorageType='TEXT', columnName='cf:a')]
 
     hbase.set_attributes(implicit_field_mapping=True,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -703,7 +648,6 @@ def test_hbase_not_map_error(sdc_builder, sdc_executor, cluster):
 
     hbase.set_attributes(on_record_error='TO_ERROR',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=True)
 
     # Build pipeline.
@@ -852,7 +796,6 @@ def test_hbase_multiple_records(sdc_builder, sdc_executor, cluster):
     hbase.set_attributes(storage_type='TEXT',
                          on_record_error='TO_ERROR',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -919,7 +862,6 @@ def test_hbase_collection_types(sdc_builder, sdc_executor, cluster):
     hbase.set_attributes(storage_type='TEXT',
                          on_record_error='DISCARD',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -979,7 +921,6 @@ def test_hbase_write_records_on_error_discard(sdc_builder, sdc_executor, cluster
     hbase.set_attributes(storage_type='TEXT',
                          on_record_error='DISCARD',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -1037,7 +978,6 @@ def test_hbase_write_records_on_error_send_to_error(sdc_builder, sdc_executor, c
     hbase.set_attributes(storage_type='TEXT',
                          on_record_error='TO_ERROR',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False)
 
     # Build pipeline
@@ -1092,7 +1032,7 @@ def test_hbase_write_records_on_error_stop_pipeline(sdc_builder, sdc_executor, c
     hbase.table_name = random_table_name
     hbase.row_key = '/key'
 
-    hbase.fields = [dict(columnValue='[/cf:a]', columnStorageType='BINARY', columnName='cf:a'),
+    hbase.fields = [dict(columnValue='/non-existing', columnStorageType='BINARY', columnName='cf:a'),
                     dict(columnValue='/cf:b', columnStorageType='BINARY', columnName='cf:b'),
                     dict(columnValue='/cf:c', columnStorageType='TEXT', columnName='cf:c'),
                     dict(columnValue='/cf:d', columnStorageType='TEXT', columnName='cf:d')]
@@ -1100,7 +1040,6 @@ def test_hbase_write_records_on_error_stop_pipeline(sdc_builder, sdc_executor, c
     hbase.set_attributes(storage_type='BINARY',
                          on_record_error='STOP_PIPELINE',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -1160,7 +1099,6 @@ def test_hbase_multiple_records_on_error(sdc_builder, sdc_executor, cluster):
     hbase.set_attributes(storage_type='TEXT',
                          on_record_error='TO_ERROR',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -1229,7 +1167,6 @@ def test_hbase_custom_time_basis(sdc_builder, sdc_executor, cluster):
     hbase.set_attributes(storage_type='TEXT',
                          on_record_error='TO_ERROR',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False,
                          time_basis='${record:value(\'/cf:b\')}')
 
@@ -1306,7 +1243,6 @@ def test_hbase_empty_time_basis(sdc_builder, sdc_executor, cluster):
     hbase.set_attributes(storage_type='TEXT',
                          on_record_error='TO_ERROR',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False,
                          time_basis='')
 
@@ -1383,7 +1319,6 @@ def test_hbase_now_time_basis(sdc_builder, sdc_executor, cluster):
     hbase.set_attributes(storage_type='TEXT',
                          on_record_error='TO_ERROR',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False,
                          time_basis='${time:now()}')
 
@@ -1511,7 +1446,6 @@ def test_hbase_regular_user(sdc_builder, sdc_executor, cluster):
                          on_record_error='DISCARD',
                          hbase_user='',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False)
 
     # Build pipeline.
@@ -1545,6 +1479,10 @@ def test_hbase_proxy_user(sdc_builder, sdc_executor, cluster):
     dev_raw_data_source >> hbase
     """
 
+    # TEST-551: Permissions missing for stage.test_hbase_destination.test_hbase_proxy_user in Kerberised cluster
+    if cluster.hbase.is_kerberized:
+        pytest.skip('HBase Proxy User requires additional configuration on the cluster.')
+
     data = {'key': 'key', 'cf:a': '20', 'cf:b': '20180702113435000'}
     json_data = json.dumps(data)
 
@@ -1572,7 +1510,6 @@ def test_hbase_proxy_user(sdc_builder, sdc_executor, cluster):
                          on_record_error='DISCARD',
                          hbase_user='foo',
                          implicit_field_mapping=False,
-                         ignore_missing_field_path=False,
                          ignore_invalid_column=False)
 
     # Build pipeline.

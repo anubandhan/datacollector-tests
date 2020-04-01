@@ -18,12 +18,14 @@ import os
 import string
 import tempfile
 
+from streamsets.sdk.utils import Version
 import avro
 import avro.schema
 from avro.datafile import DataFileWriter
 from avro.io import DatumWriter
 from streamsets.testframework.markers import ftp, sdc_min_version
 from streamsets.testframework.utils import get_random_string
+from stage.utils.utils_xml import get_xml_output_field
 from xlwt import Workbook
 
 logger = logging.getLogger(__name__)
@@ -50,8 +52,8 @@ FTP_ORIGIN_CLIENT_NAME = 'com_streamsets_pipeline_stage_origin_remote_RemoteDown
 FTP_DEST_CLIENT_NAME = 'com_streamsets_pipeline_stage_destination_remote_RemoteUploadDTarget'
 
 
-@sdc_min_version('1.4.0.0')
 @ftp
+@sdc_min_version('3.9.0')
 def test_ftp_origin_text_delete_subdirectory(sdc_builder, sdc_executor, ftp):
     """FTP origin test. We first create a two files on FTP server
     in root directory and in /TMP directore.
@@ -118,8 +120,8 @@ def test_ftp_origin_text_delete_subdirectory(sdc_builder, sdc_executor, ftp):
         client.quit()
 
 
-@sdc_min_version('1.4.0.0')
 @ftp
+@sdc_min_version('3.9.0')
 def test_ftp_origin_xml(sdc_builder, sdc_executor, ftp):
     """Test FTP origin, message is in format XML. We first create a file on FTP server
     and have the FTP origin stage read it.
@@ -147,7 +149,9 @@ def test_ftp_origin_xml(sdc_builder, sdc_executor, ftp):
     sdc_executor.stop_pipeline(sftp_ftp_client_pipeline)
     try:
         assert len(snapshot[sftp_ftp_client].output) == 1
-        assert snapshot[sftp_ftp_client].output[0].field['developer'] == expected
+        output_data = snapshot[sftp_ftp_client].output[0].field
+        developers_element = get_xml_output_field(sftp_ftp_client, output_data, 'developers')
+        assert developers_element['developer'] == expected
 
     finally:
         # Delete the test FTP origin file we created
@@ -156,48 +160,8 @@ def test_ftp_origin_xml(sdc_builder, sdc_executor, ftp):
         client.quit()
 
 
-@sdc_min_version('1.4.0.0')
 @ftp
-def test_ftp_origin_json(sdc_builder, sdc_executor, ftp):
-    """Test FTP origin, message is in format JSON. We first create a file on FTP server
-    and have the FTP origin stage read it.
-    We then assert its snapshot. The pipeline looks like:
-        sftp_ftp_client >> trash
-    """
-
-    ftp_file_name = get_random_string(string.ascii_letters, 10)
-
-    raw_text_data = json.dumps([{'Alex': 'Developer'}, {'Xavi': 'Developer'}])
-    expected = [{'Alex': 'Developer'}, {'Xavi': 'Developer'}]
-
-    ftp.put_string(ftp_file_name, raw_text_data)
-
-    builder = sdc_builder.get_pipeline_builder()
-    sftp_ftp_client = builder.add_stage(name=FTP_ORIGIN_CLIENT_NAME)
-    sftp_ftp_client.set_attributes(file_name_pattern=ftp_file_name, data_format='JSON')
-
-    trash = builder.add_stage('Trash')
-
-    sftp_ftp_client >> trash
-    sftp_ftp_client_pipeline = builder.build('FTP Origin Pipeline JSON').configure_for_environment(ftp)
-    sdc_executor.add_pipeline(sftp_ftp_client_pipeline)
-
-    snapshot = sdc_executor.capture_snapshot(sftp_ftp_client_pipeline, start_pipeline=True).snapshot
-    sdc_executor.stop_pipeline(sftp_ftp_client_pipeline)
-
-    try:
-        assert len(snapshot[sftp_ftp_client].output) == 1
-        assert snapshot[sftp_ftp_client].output[0].field == expected
-
-    finally:
-        # Delete the test FTP origin file we created
-        client = ftp.client
-        client.delete(ftp_file_name)
-        client.quit()
-
-
-@sdc_min_version('1.4.0.0')
-@ftp
+@sdc_min_version('3.9.0')
 def test_ftp_origin_avro(sdc_builder, sdc_executor, ftp):
     """Test FTP origin message is in format Avro. We first create a file on FTP server
     and have the FTP origin stage read it.
@@ -247,8 +211,8 @@ def test_ftp_origin_avro(sdc_builder, sdc_executor, ftp):
         client.quit()
 
 
-@sdc_min_version('1.4.0.0')
 @ftp
+@sdc_min_version('3.9.0')
 def test_ftp_origin_delimited_with_finisher(sdc_builder, sdc_executor, ftp):
     """Test FTP origin, message is in format Delimited. We first create a file on FTP server
     and have the FTP origin stage read it.
@@ -310,7 +274,6 @@ def test_ftp_origin_wholefile_with_finisher(sdc_builder, sdc_executor, ftp):
     """Test FTP origin message is in format Whole File. We first create two files on FTP server
     and have the FTP origin stage read them.
     We add a pipeline finisher to check when there is no more data.
-    The pipeline deletes the files.
 
     We then assert its snapshot. The pipeline looks like:
         sftp_ftp_client >> trash
@@ -335,46 +298,33 @@ def test_ftp_origin_wholefile_with_finisher(sdc_builder, sdc_executor, ftp):
     expected_2 = f'/{ftp_file_name_2}'
 
     builder = sdc_builder.get_pipeline_builder()
-    sftp_ftp_client = builder.add_stage(name=FTP_ORIGIN_CLIENT_NAME)
-    sftp_ftp_client.set_attributes(file_name_pattern=f'{ftp_file_name}*', data_format='WHOLE_FILE',
-                                   file_post_processing="DELETE")
+    origin = builder.add_stage(name=FTP_ORIGIN_CLIENT_NAME)
+    origin.set_attributes(file_name_pattern=f'{ftp_file_name}*', data_format='WHOLE_FILE')
 
     trash = builder.add_stage('Trash')
 
     pipeline_finished_executor = builder.add_stage('Pipeline Finisher Executor')
-    pipeline_finished_executor.set_attributes(
-        stage_record_preconditions=["${record:eventType() == 'no-more-data'}"])
+    pipeline_finished_executor.stage_record_preconditions = ["${record:eventType() == 'no-more-data'}"]
 
-    sftp_ftp_client >> trash
-    sftp_ftp_client >= pipeline_finished_executor
+    origin >> trash
+    origin >= pipeline_finished_executor
 
-    sftp_ftp_client_pipeline = builder.build('FTP Origin Pipeline WholeFile-Finisher').configure_for_environment(ftp)
-    sdc_executor.add_pipeline(sftp_ftp_client_pipeline)
+    pipeline = builder.build().configure_for_environment(ftp)
+    sdc_executor.add_pipeline(pipeline)
 
-    snapshot = sdc_executor.capture_snapshot(sftp_ftp_client_pipeline, batches=3, batch_size=10,
-                                             start_pipeline=True).snapshot
+    snapshot = sdc_executor.capture_snapshot(pipeline, batches=3, batch_size=10, start_pipeline=True).snapshot
     try:
-        assert len(snapshot.snapshot_batches[0][sftp_ftp_client.instance_name].output) == 1
-        assert len(snapshot.snapshot_batches[1][sftp_ftp_client.instance_name].output) == 1
+        assert len(snapshot.snapshot_batches[0][origin.instance_name].output) == 1
+        assert len(snapshot.snapshot_batches[1][origin.instance_name].output) == 1
 
-        assert snapshot.snapshot_batches[0][sftp_ftp_client.instance_name].output[0].field['fileInfo'][
-                   'file'] == expected_1
-        assert snapshot.snapshot_batches[1][sftp_ftp_client.instance_name].output[0].field['fileInfo'][
-                   'file'] == expected_2
-
-        # Assert the first file was deleted by the pipeline.
-        client.cwd('/')
-        file_list = client.nlst()
-        assert ftp_file_name_1 not in file_list
-
-        # Assert the second file was deleted in tmp folder by the pipeline.
-        assert ftp_file_name_2 not in file_list
+        assert snapshot.snapshot_batches[0][origin.instance_name].output[0].field['fileInfo']['file'] == expected_1
+        assert snapshot.snapshot_batches[1][origin.instance_name].output[0].field['fileInfo']['file'] == expected_2
     finally:
         client.quit()
 
 
-@sdc_min_version('1.4.0.0')
 @ftp
+@sdc_min_version('3.9.0')
 def test_ftp_origin_protobuf(sdc_builder, sdc_executor, ftp):
     """Test FTP origin message is in format Protobuf.
     The file is created used a first pipeline. dev_raw -> local_fs
@@ -424,8 +374,8 @@ def test_ftp_origin_protobuf(sdc_builder, sdc_executor, ftp):
         client.quit()
 
 
-@sdc_min_version('1.4.0.0')
 @ftp
+@sdc_min_version('3.9.0')
 def test_ftp_origin_syslog(sdc_builder, sdc_executor, ftp):
     """Test FTP origin using syslog format.
     We first create a file on FTP server and have the FTP origin stage read it.
@@ -466,8 +416,8 @@ def test_ftp_origin_syslog(sdc_builder, sdc_executor, ftp):
         client.quit()
 
 
-@sdc_min_version('1.4.0.0')
 @ftp
+@sdc_min_version('3.9.0')
 def test_ftp_origin_excel(sdc_builder, sdc_executor, ftp):
     """Test FTP origin using excel format.
     We first create a file on FTP server and have the FTP origin stage read it.
@@ -525,8 +475,8 @@ def test_ftp_origin_excel(sdc_builder, sdc_executor, ftp):
         os.remove(ftp_file_name)
 
 
-@sdc_min_version('1.4.0.0')
 @ftp
+@sdc_min_version('3.9.0')
 def test_ftp_origin_SDC_Record(sdc_builder, sdc_executor, ftp):
     """Test FTP origin message is in format SDC_Record.
     The file is created used a first pipeline. dev_raw -> local_fs
@@ -567,8 +517,8 @@ def test_ftp_origin_SDC_Record(sdc_builder, sdc_executor, ftp):
     assert snapshot[sftp_ftp_client].output[1].field == json_data[1]
 
 
-@sdc_min_version('1.4.0.0')
 @ftp
+@sdc_min_version('3.9.0')
 def test_ftp_destination(sdc_builder, sdc_executor, ftp):
     """Smoke test FTP destination. We first create a local file using Local FS destination stage and use that file
     for FTP destination stage to see if it gets successfully uploaded.
@@ -632,79 +582,6 @@ def test_ftp_destination(sdc_builder, sdc_executor, ftp):
         client.quit()
 
 
-@sdc_min_version('1.4.0.0')
-@ftp
-def test_ftp_destination_create_path_pathrelative_finisher(sdc_builder, sdc_executor, ftp):
-    """FTP destination. We first create a local file using Local FS destination stage and use that file
-    for FTP destination stage to see if it gets successfully uploaded.
-    The pipelines looks like:
-        dev_raw_data_source >> local_fs
-        directory >> sftp_ftp_client
-    We set up create path in True and PathRelative in False
-    """
-    # Our destination FTP file name
-    ftp_file_name = get_random_string(string.ascii_letters, 10)
-    # Local temporary directory where we will create a source file to be uploaded to FTP server
-    local_tmp_directory = os.path.join(tempfile.gettempdir(), get_random_string(string.ascii_letters, 10))
-
-    # Build source file pipeline logic
-    builder = sdc_builder.get_pipeline_builder()
-
-    dev_raw_data_source = builder.add_stage('Dev Raw Data Source')
-    dev_raw_data_source.set_attributes(data_format='TEXT', raw_data='Hello World!', stop_after_first_batch=True)
-
-    local_fs = builder.add_stage('Local FS', type='destination')
-    local_fs.set_attributes(directory_template=local_tmp_directory, data_format='TEXT')
-
-    dev_raw_data_source >> local_fs
-    local_fs_pipeline = builder.build('Local FS Pipeline Create Path Finisher')
-
-    builder = sdc_builder.get_pipeline_builder()
-
-    # Build FTP destination pipeline logic
-    directory = builder.add_stage('Directory', type='origin')
-    directory.set_attributes(data_format='WHOLE_FILE', file_name_pattern='sdc*', files_directory=local_tmp_directory)
-
-    sftp_ftp_client = builder.add_stage(name=FTP_DEST_CLIENT_NAME)
-    ftp_file_name_path = os.path.join(local_tmp_directory, ftp_file_name)
-    sftp_ftp_client.set_attributes(file_name_expression=ftp_file_name_path,
-                                   create_path=True, path_relative_to_user_homer_directory=False)
-
-    pipeline_finished_executor = builder.add_stage('Pipeline Finisher Executor')
-    pipeline_finished_executor.set_attributes(
-        stage_record_preconditions=["${record:eventType() == 'no-more-data'}"])
-
-    directory >> sftp_ftp_client
-    directory >= pipeline_finished_executor
-
-    sftp_ftp_client_pipeline = builder.build('FTP Destination Pipeline Create Path').configure_for_environment(ftp)
-
-    sdc_executor.add_pipeline(local_fs_pipeline, sftp_ftp_client_pipeline)
-
-    # Start source file creation pipeline and assert file has been created with expected number of records
-    sdc_executor.start_pipeline(local_fs_pipeline).wait_for_finished()
-    history = sdc_executor.get_pipeline_history(local_fs_pipeline)
-    assert history.latest.metrics.counter('pipeline.batchInputRecords.counter').count == 1
-    assert history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count == 1
-
-    # Start FTP upload (destination) file pipeline and assert pipeline has processed expected number of files
-    sdc_executor.start_pipeline(sftp_ftp_client_pipeline).wait_for_finished()
-
-    history = sdc_executor.get_pipeline_history(sftp_ftp_client_pipeline)
-    try:
-        assert history.latest.metrics.counter('pipeline.batchInputRecords.counter').count == 1
-        assert history.latest.metrics.counter('pipeline.batchOutputRecords.counter').count == 2
-
-        # Read FTP destination file and compare our source data to assert
-        assert ftp.get_string(ftp_file_name_path) == dev_raw_data_source.raw_data
-
-    finally:
-        # Delete the test FTP destination file we created
-        client = ftp.client
-        client.delete(ftp_file_name_path)
-        client.quit()
-
-
 def produce_lfs_messages_protobuf(ftp_file, sdc_builder, sdc_executor, message, ftp):
     # Build a dev_raw > local_fs  pipeline to create a protobuf file.
     builder = sdc_builder.get_pipeline_builder()
@@ -717,7 +594,7 @@ def produce_lfs_messages_protobuf(ftp_file, sdc_builder, sdc_executor, message, 
 
     local_fs.set_attributes(file_type='TEXT', files_prefix=ftp_file, directory_template=TMPOUT,
                             data_format='PROTOBUF', message_type='Contact',
-                            protobuf_descriptor_file=PROTOBUF_FILE_PATH, delimited_messages=False)
+                            protobuf_descriptor_file=PROTOBUF_FILE_PATH)
 
     dev_raw_data_source >> local_fs
 
@@ -736,7 +613,7 @@ def move_directory_messages_protobuf_ftp(ftp_file, sdc_builder, sdc_executor, me
     directory = builder.add_stage('Directory', type='origin')
     directory.set_attributes(data_format='WHOLE_FILE', file_name_pattern=f'{ftp_file}*', file_name_pattern_mode='GLOB',
                              file_post_processing='DELETE', files_directory=TMPOUT,
-                             process_subdirectories=False, read_order='TIMESTAMP', produce_events=True)
+                             process_subdirectories=False, read_order='TIMESTAMP')
 
     sftp_ftp_client = builder.add_stage(name=FTP_DEST_CLIENT_NAME)
     sftp_ftp_client.file_name_expression = ftp_file
@@ -785,7 +662,7 @@ def move_directory_messages_SDC_record_ftp(ftp_file, sdc_builder, sdc_executor, 
     directory = builder.add_stage('Directory', type='origin')
     directory.set_attributes(data_format='WHOLE_FILE', file_name_pattern=f'{ftp_file}*', file_name_pattern_mode='GLOB',
                              file_post_processing='DELETE', files_directory=TMPOUT,
-                             process_subdirectories=False, read_order='TIMESTAMP', produce_events=True)
+                             process_subdirectories=False, read_order='TIMESTAMP')
 
     sftp_ftp_client = builder.add_stage(name=FTP_DEST_CLIENT_NAME)
     sftp_ftp_client.file_name_expression = ftp_file

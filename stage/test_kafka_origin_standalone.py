@@ -26,6 +26,7 @@ from avro.datafile import DataFileWriter
 from streamsets.testframework.environments.cloudera import ClouderaManagerCluster
 from streamsets.testframework.markers import cluster, sdc_min_version
 from streamsets.testframework.utils import get_random_string
+from stage.utils.utils_xml import get_xml_output_field
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ def test_kafka_origin_standalone(sdc_builder, sdc_executor, cluster):
 
 
 @cluster('cdh', 'kafka')
-@sdc_min_version('3.6.0')
+@sdc_min_version('3.7.0')
 def test_kafka_origin_including_timestamps(sdc_builder, sdc_executor, cluster):
     """Check that timestamp and timestamp type are included in record header. Verifies that for previous versions of
     kafka (< 0.10), a validation issue is thrown.
@@ -132,7 +133,7 @@ def test_kafka_origin_including_timestamps(sdc_builder, sdc_executor, cluster):
 
 
 @cluster('cdh', 'kafka')
-@sdc_min_version('3.6.0')
+@sdc_min_version('3.7.0')
 def test_kafka_origin_timestamp_offset_strategy(sdc_builder, sdc_executor, cluster):
     """Check that accessing a topic for first time using TIMESTAMP offset strategy retrieves messages
     which timestamp >= Auto Offset Reset Timestamp configuration value.
@@ -252,6 +253,53 @@ def test_kafka_multi_origin_standalone(sdc_builder, sdc_executor, cluster):
         verify_kafka_origin_results(kafka_multitopic_consumer_pipeline, sdc_executor, expected, 'TEXT')
     finally:
         sdc_executor.stop_pipeline(kafka_multitopic_consumer_pipeline)
+
+
+@cluster('cdh', 'kafka')
+def test_kafka_multi_origin_standalone_honor_prod_batch_size(sdc_builder, sdc_executor, cluster):
+    """Verify that MultiTopic origin uses the 'production.maxBatchSize' value from SDC properties as the effective
+    batch size if that value is less than the user configured batch size in pipeline.
+    """
+
+    # Build the Multi-topic Kafka consumer pipeline.
+    builder = sdc_builder.get_pipeline_builder()
+
+    topic_name = get_random_string(string.ascii_letters, 10)
+    max_records = 10000
+    max_batches = 10
+    kafka_multitopic_consumer = builder.add_stage('Kafka Multitopic Consumer')
+    # Increase the user configured batch size and wait time to a higher value.
+    kafka_multitopic_consumer.set_attributes(data_format='TEXT',
+                                             max_batch_size_in_records=100000,
+                                             batch_wait_time_in_ms=60000,
+                                             topic_list=[topic_name],
+                                             consumer_group=get_random_string(string.ascii_letters, 10),
+                                             configuration_properties=[{'key': 'auto.offset.reset',
+                                                                        'value': 'earliest'}])
+    trash = builder.add_stage(label='Trash')
+    kafka_multitopic_consumer >> trash
+    kafka_multitopic_consumer_pipeline = builder.build(title='Kafka Multitopic Honor Production Batch Size'). \
+        configure_for_environment(cluster)
+    kafka_multitopic_consumer_pipeline.configuration['executionMode'] = 'STANDALONE'
+    kafka_multitopic_consumer_pipeline.configuration['shouldRetry'] = False
+
+    sdc_executor.add_pipeline(kafka_multitopic_consumer_pipeline)
+
+    producer = cluster.kafka.producer()
+    logger.info('Number of Messages to be produced: %s', max_records)
+
+    for _ in range(max_records):
+        producer.send(topic_name, 'Hello World!'.encode())
+    producer.flush()
+    # After SDC-13487, the batch size in SDC properties should be honored. So a batch size of 1000 (default in SDC
+    # props) should be used rather than 100,000 which is configured on the pipeline. With batch size of 1000, and
+    # max records as 10000, the pipeline should have 10 batches within the configured timeout.
+    sdc_executor.start_pipeline(kafka_multitopic_consumer_pipeline).wait_for_pipeline_batch_count(max_batches,
+                                                                                                  timeout_sec=180)
+    sdc_executor.stop_pipeline(kafka_multitopic_consumer_pipeline)
+    metrics = sdc_executor.get_pipeline_history(kafka_multitopic_consumer_pipeline).latest.metrics
+    assert metrics.counter("pipeline.batchInputRecords.counter").count == max_records
+
 
 
 @cluster('cdh', 'kafka')
@@ -777,7 +825,7 @@ def produce_kafka_messages_protobuf(topic, sdc_builder, sdc_executor, cluster, m
                                           library=cluster.kafka.standalone_stage_lib)
     kafka_destination.topic = topic
     kafka_destination.set_attributes(data_format='PROTOBUF', message_type='Contact',
-                                     protobuf_descriptor_file=PROTOBUF_FILE_PATH, delimited_messages=False)
+                                     protobuf_descriptor_file=PROTOBUF_FILE_PATH)
 
     dev_raw_data_source >> kafka_destination
     kafka_destination_pipeline = builder.build(
@@ -958,12 +1006,17 @@ def verify_kafka_origin_results(kafka_consumer_pipeline, sdc_executor, message, 
     snapshot_command = snapshot_pipeline_command.wait_for_finished(timeout_sec=SNAPSHOT_TIMEOUT_SEC)
     snapshot = snapshot_command.snapshot
 
-    basic_data_formats = ['XML', 'CSV', 'SYSLOG', 'COLLECTD', 'TEXT', 'JSON', 'AVRO', 'AVRO_WITHOUT_SCHEMA']
+    basic_data_formats = ['CSV', 'SYSLOG', 'COLLECTD', 'TEXT', 'JSON', 'AVRO', 'AVRO_WITHOUT_SCHEMA']
 
     # Verify snapshot data.
     if data_format in basic_data_formats:
         record_field = [record.field for record in snapshot[kafka_consumer_pipeline[0].instance_name].output]
         assert message == str(record_field[0])
+
+    elif data_format == 'XML':
+        output_data = [record.field for record in snapshot[kafka_consumer_pipeline[0].instance_name].output][0]
+        record_field = get_xml_output_field(kafka_consumer_pipeline[0], output_data, 'developers')
+        assert message == str(record_field)
 
     elif data_format == 'LOG':
         stage = snapshot[kafka_consumer_pipeline[0].instance_name]

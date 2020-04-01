@@ -22,6 +22,7 @@ import pytest
 from pretenders.common.constants import FOREVER
 from streamsets.testframework.markers import http, sdc_min_version
 from streamsets.testframework.utils import get_random_string
+from streamsets.sdk.utils import Version
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,10 @@ def http_server_pipeline(sdc_builder, sdc_executor):
     pipeline_builder = sdc_builder.get_pipeline_builder()
 
     http_server = pipeline_builder.add_stage('HTTP Server')
-    http_server.application_id = '${APPLICATION_ID}'
+    if Version(sdc_builder.version) >= Version('3.14.0'):
+        http_server.list_of_application_ids = [{"appId":'${APPLICATION_ID}'}]
+    else:
+        http_server.application_id = '${APPLICATION_ID}'
     http_server.data_format = 'JSON'
     http_server.http_listening_port = '${HTTP_PORT}'
 
@@ -177,14 +181,17 @@ def test_http_client_target_wrong_host(sdc_executor, http_client_pipeline):
 
 
 @http
-def test_http_processor_get(sdc_builder, sdc_executor, http_client):
-    """Test HTTP Lookup Processor for HTTP GET method. We do so by requesting to a pre-defined
-    HTTP server endpoint (testGetJsonEndpoint) and get as expected data. The pipeline looks like:
+@sdc_min_version("3.11.0")
+def test_http_processor_multiple_records(sdc_builder, sdc_executor, http_client):
+    """Test HTTP Lookup Processor for HTTP GET method and split the obtained result
+    in different records:
 
         dev_raw_data_source >> http_client_processor >> trash
     """
-    expected_dict = dict(latitude='37.7576948', longitude='-122.4726194')
-    expected_data = json.dumps(expected_dict)
+    #The data returned by the HTTP mock server
+    dataArr = [{'A':i,'C':i+1,'G':i+2,'T':i+3} for i in range(10)]
+
+    expected_data = json.dumps(dataArr)
     record_output_field = 'result'
     mock_path = get_random_string(string.ascii_letters, 10)
     http_mock = http_client.mock()
@@ -199,24 +206,78 @@ def test_http_processor_get(sdc_builder, sdc_executor, http_client):
         http_client_processor = builder.add_stage('HTTP Client', type='processor')
         http_client_processor.set_attributes(data_format='JSON', http_method='GET',
                                              resource_url=mock_uri,
-                                             output_field=f'/{record_output_field}')
+                                             output_field=f'/{record_output_field}',
+                                             multiple_values_behavior='SPLIT_INTO_MULTIPLE_RECORDS')
         trash = builder.add_stage('Trash')
 
         dev_raw_data_source >> http_client_processor >> trash
-        pipeline = builder.build(title='HTTP Lookup GET Processor pipeline')
+        pipeline = builder.build(title='HTTP Lookup GET Processor Split Multiple Records pipeline')
         sdc_executor.add_pipeline(pipeline)
 
         snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
         sdc_executor.stop_pipeline(pipeline)
 
-        # ensure HTTP GET result is only stored to one record and assert the data
-        assert len(snapshot[http_client_processor.instance_name].output) == 1
-        record = snapshot[http_client_processor.instance_name].output[0].field
-        assert record[record_output_field]['latitude'] == expected_dict['latitude']
-        assert record[record_output_field]['longitude'] == expected_dict['longitude']
+        # ensure HTTP GET result has 10 different records
+        assert len(snapshot[http_client_processor.instance_name].output) == 10
+        # check each
+        for x in range(10):
+            assert snapshot[http_client_processor.instance_name].output[x].field[record_output_field]['A'] == x
+            assert snapshot[http_client_processor.instance_name].output[x].field[record_output_field]['C'] == x+1
+            assert snapshot[http_client_processor.instance_name].output[x].field[record_output_field]['G'] == x+2
+            assert snapshot[http_client_processor.instance_name].output[x].field[record_output_field]['T'] == x+3
+
     finally:
         http_mock.delete_mock()
 
+
+@http
+@sdc_min_version("3.11.0")
+def test_http_processor_list(sdc_builder, sdc_executor, http_client):
+    """Test HTTP Lookup Processor for HTTP GET method and split the obtained result
+    in different elements of the same list stored in just one record:
+
+        dev_raw_data_source >> http_client_processor >> trash
+    """
+    #The data returned by the HTTP mock server
+    dataArr = [{'A':i,'C':i+1,'G':i+2,'T':i+3} for i in range(10)]
+
+    expected_data = json.dumps(dataArr)
+    record_output_field = 'result'
+    mock_path = get_random_string(string.ascii_letters, 10)
+    http_mock = http_client.mock()
+
+    try:
+        http_mock.when(f'GET /{mock_path}').reply(expected_data, times=FOREVER)
+        mock_uri = f'{http_mock.pretend_url}/{mock_path}'
+
+        builder = sdc_builder.get_pipeline_builder()
+        dev_raw_data_source = builder.add_stage('Dev Raw Data Source')
+        dev_raw_data_source.set_attributes(data_format='TEXT', raw_data='dummy')
+        http_client_processor = builder.add_stage('HTTP Client', type='processor')
+        http_client_processor.set_attributes(data_format='JSON', http_method='GET',
+                                             resource_url=mock_uri,
+                                             output_field=f'/{record_output_field}',
+                                             multiple_values_behavior='ALL_AS_LIST')
+        trash = builder.add_stage('Trash')
+
+        dev_raw_data_source >> http_client_processor >> trash
+        pipeline = builder.build(title='HTTP Lookup GET Processor All As List pipeline')
+        sdc_executor.add_pipeline(pipeline)
+
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        # ensure HTTP GET result has 1 record (The list containing the 10 elements)
+        assert len(snapshot[http_client_processor.instance_name].output) == 1
+        # check each element of the list
+        for x in range(10):
+            assert snapshot[http_client_processor.instance_name].output[0].field[record_output_field][x]['A'] == x+0
+            assert snapshot[http_client_processor.instance_name].output[0].field[record_output_field][x]['C'] == x+1
+            assert snapshot[http_client_processor.instance_name].output[0].field[record_output_field][x]['G'] == x+2
+            assert snapshot[http_client_processor.instance_name].output[0].field[record_output_field][x]['T'] == x+3
+
+    finally:
+        http_mock.delete_mock()
 
 @http
 @pytest.mark.parametrize(('method'), [
@@ -319,7 +380,7 @@ def test_http_destination(sdc_builder, sdc_executor, http_client, method, reques
         dev_raw_data_source.set_attributes(data_format='JSON', raw_data=raw_data)
         http_client_destination = builder.add_stage('HTTP Client', type='destination')
         # for POST/PATCH, we post 'raw_data' and expect 'expected_dict' as response data
-        http_client_destination.set_attributes(data_format='JSON', default_request_content_type='application/json',
+        http_client_destination.set_attributes(data_format='JSON',
                                                headers=[{'key': 'content-length', 'value': f'{len(raw_data)}'}],
                                                http_method=method,
                                                resource_url=mock_uri,
@@ -339,43 +400,6 @@ def test_http_destination(sdc_builder, sdc_executor, http_client, method, reques
         assert r.url == f'/{mock_path}'
         assert r.body
         assert json.loads(r.body.decode("utf-8")) == raw_dict
-    finally:
-        http_mock.delete_mock()
-
-
-@http
-def test_http_client_source_simple(sdc_builder, sdc_executor, http_client):
-    """Test HTTP Client source basic (single batch, not streaming) HTTP server endpoint and
-    assert expected data. The pipeline looks like:
-
-        http_client_source >> trash
-    """
-    raw_data = '{"first:": 1}'
-    mock_path = get_random_string(string.ascii_letters, 10)
-    http_mock = http_client.mock()
-
-    try:
-        http_mock.when(f'GET /{mock_path}').reply(raw_data, times=FOREVER)
-        mock_uri = f'{http_mock.pretend_url}/{mock_path}'
-
-        builder = sdc_builder.get_pipeline_builder()
-        http_client_source = builder.add_stage('HTTP Client', type='origin')
-        http_client_source.set_attributes(data_format='JSON', resource_url=mock_uri)
-
-        trash = builder.add_stage('Trash')
-
-        http_client_source >> trash
-
-        pipeline = builder.build(title='HTTP Client Simple')
-        sdc_executor.add_pipeline(pipeline)
-
-        snapshot = sdc_executor.capture_snapshot(pipeline, batches=1, batch_size=1,
-                                                 start_pipeline=True).snapshot
-        sdc_executor.stop_pipeline(pipeline)
-        origin_stage_output = snapshot[http_client_source.instance_name]
-
-        assert len(origin_stage_output.output) == 1
-        assert origin_stage_output.output[0].field == json.loads(raw_data)
     finally:
         http_mock.delete_mock()
 
@@ -406,3 +430,63 @@ def test_http_server_method_restriction(sdc_executor, http_server_pipeline):
     assert resp.status == 405
 
     sdc_executor.stop_pipeline(http_server_pipeline.pipeline)
+
+
+@http
+@sdc_min_version("3.14.0")
+def test_http_server_no_application_id(sdc_executor, http_server_pipeline):
+    """HTTP Server Origin with no Application-ID must accept any request that does not contain any Application-ID"""
+    server_runtime_parameters = {'HTTP_PORT': 9999,
+                                 'APPLICATION_ID': ''}
+    sdc_executor.start_pipeline(http_server_pipeline.pipeline, server_runtime_parameters)
+
+    try:
+        # Try a GET request using sample data with no application ID and we should expect a 200 response.
+        http_res = httpclient.HTTPConnection(sdc_executor.server_host, 9999)
+        http_res.request('GET', '/', '{"f1": "abc"}{"f1": "xyz"}')
+        resp = http_res.getresponse()
+        assert resp.status == 200
+    finally:
+        sdc_executor.stop_pipeline(http_server_pipeline.pipeline)
+
+@http
+@sdc_min_version("3.14.0")
+def test_http_server_multiple_application_ids(sdc_builder, sdc_executor):
+    """HTTP Server Origin with some valid Application-ID must accept any request that contains
+     a valid Application-ID"""
+
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+
+    http_server = pipeline_builder.add_stage('HTTP Server')
+    http_server.list_of_application_ids = [{"appId":'TEST_ID_FIRST'},{"appId":'TEST_ID_SECOND'}]
+    http_server.data_format = 'JSON'
+    http_server.http_listening_port = 9999
+
+    trash = pipeline_builder.add_stage('Trash')
+
+    http_server >>  trash
+    pipeline = pipeline_builder.build()
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        sdc_executor.start_pipeline(pipeline)
+
+        # Try a GET request using sample data with a valid Application-ID and we should expect a 200 response.
+        http_res = httpclient.HTTPConnection(sdc_executor.server_host, 9999)
+        http_res.request('GET', '/', '{"f1": "abc"}{"f1": "xyz"}',{'X-SDC-APPLICATION-ID': 'TEST_ID_FIRST'})
+        resp = http_res.getresponse()
+        assert resp.status == 200
+
+        # Try a GET request using sample data with another valid Application-ID and we should expect a 200 response.
+        http_res = httpclient.HTTPConnection(sdc_executor.server_host, 9999)
+        http_res.request('GET', '/', '{"f1": "abc"}{"f1": "xyz"}',{'X-SDC-APPLICATION-ID': 'TEST_ID_SECOND'})
+        resp = http_res.getresponse()
+        assert resp.status == 200
+
+        # Try a GET request using sample data with a non valid Application-ID and we should expect a 403 response.
+        http_res = httpclient.HTTPConnection(sdc_executor.server_host, 9999)
+        http_res.request('GET', '/', '{"f1": "abc"}{"f1": "xyz"}',{'X-SDC-APPLICATION-ID': 'TEST_ID_THIRD'})
+        resp = http_res.getresponse()
+        assert resp.status == 403
+    finally:
+        sdc_executor.stop_pipeline(pipeline)

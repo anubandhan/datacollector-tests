@@ -26,13 +26,21 @@ import logging
 import string
 
 import avro
+import base64
+import io
 import pytest
+from avro.io import DatumReader, BinaryDecoder
 from streamsets.sdk.models import Configuration
 from streamsets.testframework.markers import cluster, confluent, sdc_min_version
 from streamsets.testframework.utils import get_random_string
+from streamsets.testframework.environments import kafka
+
+import confluent_kafka.avro
+from confluent_kafka.admin import AdminClient, NewTopic
+from confluent_kafka.avro import AvroProducer
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 AVRO_SCHEMA = '{"type":"record","name":"Brno","doc":"","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}'
 
@@ -41,7 +49,7 @@ AVRO_SCHEMA = '{"type":"record","name":"Brno","doc":"","fields":[{"name":"a","ty
 def topic():
     """Topic name used for this specific test."""
     topic = get_random_string(string.ascii_letters, 10)
-    logger.debug('Using Topic: %s', topic)
+    logger.info('Using Topic: %s', topic)
     return topic
 
 
@@ -58,6 +66,7 @@ def consumer_single(sdc_builder, topic, cluster, confluent):
                                   lookup_schema_by='AUTO',
                                   key_deserializer='CONFLUENT',
                                   value_deserializer='CONFLUENT',
+                                  max_batch_size_in_records=10,
                                   kafka_configuration=[{'key': 'auto.offset.reset', 'value': 'earliest'}])
 
     trash = builder.add_stage(label='Trash')
@@ -78,6 +87,7 @@ def consumer_multi(sdc_builder, topic, cluster, confluent):
                                   avro_schema_location='REGISTRY',
                                   lookup_schema_by='AUTO',
                                   key_deserializer='CONFLUENT',
+                                  max_batch_size_in_records=10,
                                   value_deserializer='CONFLUENT',
                                   configuration_properties=[{'key': 'auto.offset.reset', 'value': 'earliest'}])
 
@@ -237,3 +247,295 @@ def perform_test(sdc_executor, producer, consumer):
     assert len(output) == 1
     assert output[0].field['a'].value == 1
     assert output[0].field['b'].value == 'Text'
+
+
+@pytest.mark.parametrize('key_capture_mode', ['RECORD_FIELD', 'RECORD_HEADER', 'RECORD_HEADER_AND_FIELD'])
+@cluster('kafka')
+@confluent
+@sdc_min_version('3.11.0')
+def test_kafka_consumer_key_capture_modes(sdc_builder, sdc_executor, cluster, confluent, topic, key_capture_mode):
+    """
+    Test the KeyCaptureMode introduced in SDC-4813
+    
+    We will first publish an Avro message (with separate key and value schema) to Kafka, then try to read it from a
+    pipeline, and ensure the key is captured correctly as per configuration.
+    """
+    if ('streamsets-datacollector-apache-kafka_0_9-lib' in cluster.sdc_stage_libs):
+        pytest.skip('Test only designed to run on Kafka version >= 0.10.0')
+
+    broker_url = cluster.kafka.brokers[0].replace("kafka://", "")
+
+    avro_producer = AvroProducer({
+      'bootstrap.servers': broker_url,
+      'schema.registry.url': confluent._registry_urls[0]
+    })
+
+    value_schema_str = """
+    {
+       "namespace": "",
+       "name": "valueType",
+       "type": "record",
+       "fields" : [
+         {
+           "name" : "f1",
+           "type" : "string"
+         }, {
+           "name" : "f2",
+           "type" : "float"
+         }
+       ]
+    }
+    """
+    
+    key_schema_str = """
+    {
+       "namespace": "",
+       "name": "keyType",
+       "type": "record",
+       "fields" : [
+         {
+           "name" : "k1",
+           "type" : "long"
+         }, {
+           "name" : "k2",
+           "type" : "int"
+         }
+       ]
+    }
+    """
+
+    value_schema = confluent_kafka.avro.loads(value_schema_str)
+    key_schema = confluent_kafka.avro.loads(key_schema_str)
+
+    k1_val = 17
+    k2_val = 8
+    f1_val = "foo"
+    f2_val = 18.6
+
+    key = {"k1": k1_val, "k2": k2_val}
+    value = {"f1": f1_val, "f2": f2_val}
+
+    # publish the Avro key/value message to Kafka
+    avro_producer.produce(topic=topic, value=value, key=key, key_schema=key_schema, value_schema=value_schema)
+    avro_producer.flush()
+
+    # now, build a pipeline to read the message
+    builder = sdc_builder.get_pipeline_builder()
+    builder.add_error_stage('Discard')
+
+    key_capture_field = '/mySpecialKey'
+    key_capture_attribute = 'mySpecialKey'
+
+    kafka_consumer = builder.add_stage('Kafka Consumer', library=cluster.kafka.standalone_stage_lib)
+    kafka_consumer.set_attributes(topic=topic,
+                                  data_format='AVRO',
+                                  avro_schema_location='REGISTRY',
+                                  lookup_schema_by='AUTO',
+                                  key_deserializer='CONFLUENT',
+                                  value_deserializer='CONFLUENT',
+                                  key_capture_mode=key_capture_mode,
+                                  key_capture_field=key_capture_field,
+                                  key_capture_header_attribute=key_capture_attribute,
+                                  kafka_configuration=[{'key': 'auto.offset.reset', 'value': 'earliest'}])
+
+    trash = builder.add_stage(label='Trash')
+    kafka_consumer >> trash
+
+    pipeline = builder.build(title=f'Single Message Key Consumer for {topic}').configure_for_environment(cluster, confluent)
+
+    sdc_executor.add_pipeline(pipeline)
+
+    snapshot_command = sdc_executor.capture_snapshot(pipeline, start_pipeline=True)
+    sdc_executor.stop_pipeline(pipeline)
+
+    # Validate result
+    snapshot = snapshot_command.snapshot
+    assert snapshot is not None
+    output = snapshot[pipeline.origin_stage].output
+
+    assert output is not None
+    assert len(output) == 1
+    record = output[0]
+
+    verify_kafka_avro_messages(record, key_capture_mode, key_capture_field, key_capture_attribute, key_schema, key, value)
+
+
+@pytest.mark.parametrize('key_capture_mode', ['RECORD_HEADER'])
+@cluster('kafka')
+@confluent
+@sdc_min_version('3.11.0')
+def test_kafka_producer_key_capture(sdc_builder, sdc_executor, cluster, confluent, topic, key_capture_mode):
+    """
+    Test the Kafka producer with avro key
+
+    We will have 2 pipelines:
+    1. kafka_consumer >> kafka_producer
+    2. kafka_consumer >> trash
+
+    In the first pipeline, we will first publish an Avro message (with separate key and value schema) to Kafka,
+    then read it and ensure that the key is captured correctly as per configuration and then write the key and value
+    back to kafka in a separate topic.
+    In the second pipeline, we will read the avro key and value written by the first pipeline and assert if the key
+    and value is correct
+    """
+    if ('streamsets-datacollector-apache-kafka_0_9-lib' in cluster.sdc_stage_libs):
+        pytest.skip('Test only designed to run on Kafka version >= 0.10.0')
+
+    broker_url = cluster.kafka.brokers[0].replace("kafka://", "")
+
+    avro_producer = AvroProducer({
+        'bootstrap.servers': broker_url,
+        'schema.registry.url': confluent._registry_urls[0]
+    })
+
+    value_schema_str = """
+    {
+       "namespace": "",
+       "name": "valueType",
+       "type": "record",
+       "fields" : [
+         {
+           "name" : "f1",
+           "type" : "string"
+         }, {
+           "name" : "f2",
+           "type" : "float"
+         }
+       ]
+    }
+    """
+
+    key_schema_str = """
+    {
+       "namespace": "",
+       "name": "keyType",
+       "type": "record",
+       "fields" : [
+         {
+           "name" : "k1",
+           "type" : "long"
+         }, {
+           "name" : "k2",
+           "type" : "int"
+         }
+       ]
+    }
+    """
+
+    value_schema = confluent_kafka.avro.loads(value_schema_str)
+    key_schema = confluent_kafka.avro.loads(key_schema_str)
+
+    k1_val = 17
+    k2_val = 8
+    f1_val = "foo"
+    f2_val = 18.6
+
+    key = {"k1": k1_val, "k2": k2_val}
+    value = {"f1": f1_val, "f2": f2_val}
+
+    # publish the Avro key/value message to Kafka
+    avro_producer.produce(topic=topic, value=value, key=key, key_schema=key_schema, value_schema=value_schema)
+    avro_producer.flush()
+
+    # now, build a pipeline to read the message
+    builder1 = sdc_builder.get_pipeline_builder()
+    builder1.add_error_stage('Discard')
+
+    key_capture_attribute = 'kafkaMessageKey'
+
+    kafka_consumer1 = builder1.add_stage('Kafka Consumer', library=cluster.kafka.standalone_stage_lib)
+    kafka_consumer1.set_attributes(topic=topic,
+                                  data_format='AVRO',
+                                  avro_schema_location='REGISTRY',
+                                  lookup_schema_by='AUTO',
+                                  key_deserializer='CONFLUENT',
+                                  value_deserializer='CONFLUENT',
+                                  key_capture_mode=key_capture_mode,
+                                  key_capture_header_attribute=key_capture_attribute,
+                                  kafka_configuration=[{'key': 'auto.offset.reset', 'value': 'earliest'}])
+
+    topic_producer = get_random_string(string.ascii_letters, 10)
+    kafka_producer = builder1.add_stage('Kafka Producer', library=cluster.kafka.standalone_stage_lib)
+    kafka_producer.set_attributes(topic=topic_producer,
+                                  data_format='AVRO',
+                                  avro_schema_location='REGISTRY',
+                                  include_schema=False,
+                                  register_schema=True,
+                                  schema_subject=f'{topic}-value',
+                                  message_key_format='AVRO',
+                                  key_serializer='CONFLUENT',
+                                  value_serializer='CONFLUENT')
+
+    kafka_consumer1 >> kafka_producer
+
+    pipeline1 = builder1.build(title=f'Single Message Key Consumer for {topic}').configure_for_environment(cluster,
+                                                                                                           confluent)
+    sdc_executor.add_pipeline(pipeline1)
+    snapshot_command1 = sdc_executor.capture_snapshot(pipeline1, start_pipeline=True)
+    sdc_executor.stop_pipeline(pipeline1)
+
+    # Build another pipeline to read the avro that was written into the topic(topic_producer)
+    builder2 = sdc_builder.get_pipeline_builder()
+    builder2.add_error_stage('Discard')
+    kafka_consumer2 = builder2.add_stage('Kafka Consumer', library=cluster.kafka.standalone_stage_lib)
+
+    # Kafka consumer to read the avro written by kafka_producer
+    kafka_consumer2.set_attributes(topic=topic_producer,
+                                   data_format='AVRO',
+                                   avro_schema_location='REGISTRY',
+                                   lookup_schema_by='AUTO',
+                                   key_deserializer='CONFLUENT',
+                                   value_deserializer='CONFLUENT',
+                                   key_capture_mode=key_capture_mode,
+                                   key_capture_header_attribute=key_capture_attribute,
+                                   kafka_configuration=[{'key': 'auto.offset.reset', 'value': 'earliest'}])
+
+    trash = builder2.add_stage(label='Trash')
+    kafka_consumer2 >> trash
+
+    pipeline2 = builder2.build(title=f'Single Message Key Consumer for {topic_producer}').configure_for_environment(cluster,
+                                                                                                                    confluent)
+
+    sdc_executor.add_pipeline(pipeline2)
+    snapshot_command2 = sdc_executor.capture_snapshot(pipeline2, start_pipeline=True)
+    sdc_executor.stop_pipeline(pipeline2)
+
+    # Validate result
+    snapshot2 = snapshot_command2.snapshot
+    output = snapshot2[pipeline2.origin_stage].output
+
+    assert output is not None
+    assert len(output) == 1
+    record = output[0]
+
+    verify_kafka_avro_messages(record, key_capture_mode, None, key_capture_attribute, key_schema, key, value)
+
+
+def verify_kafka_avro_messages(record, key_capture_mode, key_capture_field, key_capture_attribute, key_schema, message_keys, message_values):
+
+    for key,value in message_values.items():
+      assert record.get_field_data(f'/{key}').value == value
+
+    # validate message key fields/attribute based on configuration
+    if (key_capture_mode in ['RECORD_FIELD', 'RECORD_HEADER_AND_FIELD']):
+      # the message key should have been captured into the configured field
+      for key,value in message_keys.items():
+        assert record.get_field_data(f"{key_capture_field}/{key}").value == value
+
+    if (key_capture_mode in ['RECORD_HEADER', 'RECORD_HEADER_AND_FIELD']):
+      # get the base64 encoded Avro message key
+      encoded = record.header['values'][key_capture_attribute]
+      # decode into bytes
+      key_bytes = base64.standard_b64decode(encoded)
+      # create an Avro binary decoder based on those bytes
+      decoder = BinaryDecoder(io.BytesIO(key_bytes))
+      # parse the key schema out of the record header
+      decoded_key_schema = confluent_kafka.avro.loads(record.header['values']['avroKeySchema'])
+      # ensure the parsed key schema matches the one we actually produced, earlier
+      assert decoded_key_schema == key_schema
+      # create a DatumReader to read a full Avro record (the key)
+      reader = DatumReader(decoded_key_schema)
+      decoded_avro_key = reader.read(decoder)
+      # assert the values from the Avro record match what's expected
+      for key,value in message_keys.items():
+        assert decoded_avro_key[key] == value

@@ -16,13 +16,18 @@ import copy
 import json
 import logging
 import math
+import os
 import random
 import string
+import tempfile
 import time
+from collections import OrderedDict
 
 import pytest
 import sqlalchemy
-from streamsets.testframework.environments.databases import OracleDatabase, SQLServerDatabase
+import datetime
+from streamsets.sdk.utils import Version
+from streamsets.testframework.environments.databases import Db2Database, OracleDatabase, SQLServerDatabase, PostgreSqlDatabase
 from streamsets.testframework.markers import credentialstore, database, sdc_min_version
 from streamsets.testframework.utils import get_random_string
 
@@ -39,6 +44,8 @@ ROWS_TO_UPDATE = [
 ]
 LOOKUP_RAW_DATA = ['id'] + [str(row['id']) for row in ROWS_IN_DATABASE]
 RAW_DATA = ['name'] + [row['name'] for row in ROWS_IN_DATABASE]
+
+DEFAULT_DB2_SCHEMA = 'DB2INST1'
 
 
 @database
@@ -398,7 +405,7 @@ def _create_schema(schema_name, database):
     """
     if isinstance(database, OracleDatabase):
         database.engine.execute('CREATE USER {user} IDENTIFIED BY {pwd}'.format(user=schema_name, pwd=schema_name))
-        database.engine.execute('GRANT UNLIMITED TABLESPACE TO {user}'.format(user=schema_name))
+        database.engine.execute('GRANT CONNECT, RESOURCE TO {user}'.format(user=schema_name))
     else:
         schema = sqlalchemy.schema.CreateSchema(schema_name)
         database.engine.execute(schema)
@@ -413,7 +420,7 @@ def _drop_schema(schema_name, database):
 
     """
     if isinstance(database, OracleDatabase):
-        database.engine.execute('DROP USER {user}'.format(user=schema_name))
+        database.engine.execute('DROP USER {user} CASCADE'.format(user=schema_name))
     else:
         sqlalchemy.schema.DropSchema(schema_name)
 
@@ -478,7 +485,7 @@ def test_jdbc_tee_processor(sdc_builder, sdc_executor, database):
     if isinstance(database, OracleDatabase):
         pytest.skip('JDBC Tee Processor does not support Oracle')
     elif type(database) == SQLServerDatabase:
-        pytest.skip('JDBC Tee Processor does not support multi row op on SQL Server')
+        pytest.skip('JDBC Tee Processor does not support SQL Server')
 
     table_name = get_random_string(string.ascii_lowercase, 20)
     table = _create_table(table_name, database)
@@ -535,9 +542,8 @@ def test_jdbc_tee_processor_multi_ops(sdc_builder, sdc_executor, database, use_m
     """
     if isinstance(database, OracleDatabase):
         pytest.skip('JDBC Tee Processor does not support Oracle')
-
-    if use_multi_row == True and type(database) == SQLServerDatabase:
-        pytest.skip('JDBC Tee Processor does not support multi row on SQL Server')
+    elif type(database) == SQLServerDatabase:
+        pytest.skip('JDBC Tee Processor does not support SQL Server')
 
     table_name = get_random_string(string.ascii_lowercase, 20)
     pipeline_builder = sdc_builder.get_pipeline_builder()
@@ -633,7 +639,10 @@ def test_jdbc_query_executor(sdc_builder, sdc_executor, database):
     jdbc_query_executor = pipeline_builder.add_stage('JDBC Query', type='executor')
     query_str = f"INSERT INTO {table_name} (name, id) VALUES ('${{record:value('/name')}}', '${{record:value('/id')}}')"
 
-    jdbc_query_executor.set_attributes(sql_query=query_str)
+    if Version(sdc_builder.version) < Version('3.14.0'):
+        jdbc_query_executor.set_attributes(sql_query=query_str)
+    else:
+        jdbc_query_executor.set_attributes(sql_queries=[query_str])
 
     trash = pipeline_builder.add_stage('Trash')
     dev_raw_data_source >> record_deduplicator >> jdbc_query_executor
@@ -655,6 +664,422 @@ def test_jdbc_query_executor(sdc_builder, sdc_executor, database):
 
 
 @database
+@sdc_min_version('3.14.0')  # multiple queries execution
+def test_jdbc_query_executor_multiple_queries(sdc_builder, sdc_executor, database):
+    """Simple JDBC Query Executor test.
+    Pipeline will insert records into database and then using sqlalchemy, the verification will happen
+    that correct data is inserted into database.
+
+    This is achieved by using a deduplicator which assures us that there is only one ingest to database.
+    The pipeline looks like:
+        dev_raw_data_source >> record_deduplicator >> jdbc_query_executor
+                               record_deduplicator >> trash
+    """
+    table_name = f'stf_{get_random_string(string.ascii_lowercase, 20)}'
+    table = _create_table(table_name, database)
+
+    ROWS_IN_DATABASE_UPDATED = [
+        {'id': 1, 'name': 'Alex'},
+        {'id': 2, 'name': 'Alex'},
+        {'id': 3, 'name': 'Alex'}
+    ]
+
+    DATA = ['id,name'] + [','.join(str(item) for item in rec.values()) for rec in ROWS_IN_DATABASE]
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.set_attributes(data_format='DELIMITED',
+                                       header_line='WITH_HEADER',
+                                       raw_data='\n'.join(DATA))
+
+    record_deduplicator = pipeline_builder.add_stage('Record Deduplicator')
+
+    jdbc_query_executor = pipeline_builder.add_stage('JDBC Query', type='executor')
+    query_str1 = f"INSERT INTO {table_name} (name, id) VALUES ('${{record:value('/name')}}', '${{record:value('/id')}}')"
+    query_str2 = f"UPDATE {table_name} SET name = 'Alex' WHERE name = '${{record:value('/name')}}'"
+
+    jdbc_query_executor.set_attributes(sql_queries=[query_str1, query_str2])
+
+    trash = pipeline_builder.add_stage('Trash')
+    dev_raw_data_source >> record_deduplicator >> jdbc_query_executor
+    record_deduplicator >> trash
+    pipeline = pipeline_builder.build(title='JDBC Query Executor').configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        sdc_executor.start_pipeline(pipeline).wait_for_pipeline_output_records_count(len(RAW_DATA) - 1)
+        sdc_executor.stop_pipeline(pipeline)
+
+        result = database.engine.execute(table.select())
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
+        result.close()
+        assert data_from_database == [(record['name'], record['id']) for record in ROWS_IN_DATABASE_UPDATED]
+    finally:
+        logger.info(f'Dropping table {table_name} in {database.type} database ...')
+        table.drop(database.engine)
+
+
+@database
+@sdc_min_version('3.11.0')
+def test_jdbc_query_executor_successful_query_event(sdc_builder, sdc_executor, database):
+    """Simple JDBC Query Executor test for successful-query event type.
+    Pipeline will insert records into database and then using sqlalchemy, the verification will happen
+    that correct data is inserted into database. Event records are verified for successful-query event type.
+
+    This is achieved by using a deduplicator which assures us that there is only one ingest to database.
+    The pipeline looks like:
+        dev_raw_data_source >> record_deduplicator >> jdbc_query_executor >= trash1
+                               record_deduplicator >> trash2
+    """
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    table = _create_table(table_name, database)
+
+    DATA = ['id,name'] + [','.join(str(item) for item in rec.values()) for rec in ROWS_IN_DATABASE]
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.set_attributes(data_format='DELIMITED',
+                                       header_line='WITH_HEADER',
+                                       raw_data='\n'.join(DATA))
+
+    query_str = f"INSERT INTO {table_name} (name, id) VALUES ('${{record:value('/name')}}', '${{record:value('/id')}}')"
+
+    jdbc_query_executor = pipeline_builder.add_stage('JDBC Query', type='executor')
+
+    if Version(sdc_builder.version) < Version('3.14.0'):
+        jdbc_query_executor.set_attributes(sql_query=query_str)
+    else:
+        jdbc_query_executor.set_attributes(sql_queries=[query_str])
+
+    record_deduplicator = pipeline_builder.add_stage('Record Deduplicator')
+    trash1 = pipeline_builder.add_stage('Trash')
+    trash2 = pipeline_builder.add_stage('Trash')
+
+    dev_raw_data_source >> record_deduplicator >> jdbc_query_executor >= trash1
+    record_deduplicator >> trash2
+    pipeline = pipeline_builder.build(title='JDBC Query Executor').configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        event_records = snapshot[jdbc_query_executor.instance_name].event_records
+        assert len(event_records) == 3
+        assert 'successful-query' == event_records[0].header['values']['sdc.event.type']
+        assert 'successful-query' == event_records[1].header['values']['sdc.event.type']
+        assert 'successful-query' == event_records[2].header['values']['sdc.event.type']
+
+        result = database.engine.execute(table.select())
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
+        result.close()
+        assert data_from_database == [(record['name'], record['id']) for record in ROWS_IN_DATABASE]
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
+@sdc_min_version('3.11.0')
+def test_jdbc_query_executor_insert_query_result_count(sdc_builder, sdc_executor, database):
+    """Simple JDBC Query Executor test for successful-query event type and query result count enabled.
+    Pipeline will insert records into database and then using sqlalchemy, the verification will happen
+    that correct data is inserted into database. Event records are verified for successful-query event type
+    and query-result field for the insert query.
+
+    This is achieved by using a deduplicator which assures us that there is only one ingest to database.
+    The pipeline looks like:
+        dev_raw_data_source >> record_deduplicator >> jdbc_query_executor >= trash1
+                               record_deduplicator >> trash2
+    """
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    table = _create_table(table_name, database)
+
+    DATA = ['id,name'] + [','.join(str(item) for item in rec.values()) for rec in ROWS_IN_DATABASE]
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.set_attributes(data_format='DELIMITED',
+                                       header_line='WITH_HEADER',
+                                       raw_data='\n'.join(DATA))
+
+    query_str = f"INSERT INTO {table_name} (name, id) VALUES ('${{record:value('/name')}}', '${{record:value('/id')}}')"
+
+    jdbc_query_executor = pipeline_builder.add_stage('JDBC Query', type='executor')
+
+    jdbc_query_executor.set_attributes(include_query_result_count_in_events=True)
+
+    if Version(sdc_builder.version) < Version('3.14.0'):
+        jdbc_query_executor.set_attributes(sql_query=query_str)
+    else:
+        jdbc_query_executor.set_attributes(sql_queries=[query_str])
+
+    record_deduplicator = pipeline_builder.add_stage('Record Deduplicator')
+    trash1 = pipeline_builder.add_stage('Trash')
+    trash2 = pipeline_builder.add_stage('Trash')
+
+    dev_raw_data_source >> record_deduplicator >> jdbc_query_executor >= trash1
+    record_deduplicator >> trash2
+    pipeline = pipeline_builder.build(title='JDBC Query Executor').configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        event_records = snapshot[jdbc_query_executor.instance_name].event_records
+        assert len(event_records) == 3
+        assert 'successful-query' == event_records[0].header['values']['sdc.event.type']
+        assert 'successful-query' == event_records[1].header['values']['sdc.event.type']
+        assert 'successful-query' == event_records[2].header['values']['sdc.event.type']
+
+        assert '1 row(s) affected' == event_records[0].value['value']['query-result']['value']
+        assert '1 row(s) affected' == event_records[1].value['value']['query-result']['value']
+        assert '1 row(s) affected' == event_records[2].value['value']['query-result']['value']
+
+        result = database.engine.execute(table.select())
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
+        result.close()
+        assert data_from_database == [(record['name'], record['id']) for record in ROWS_IN_DATABASE]
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
+@sdc_min_version('3.0.0.0')
+def test_jdbc_query_executor_lifecycle_events(sdc_builder, sdc_executor, database):
+    """Verify that the JDBC Query Executor will work properly when used inside pipeline lifecycle stages."""
+    if isinstance(database, OracleDatabase):
+        pytest.skip('This test does not support Oracle')
+    elif type(database) == SQLServerDatabase:
+        pytest.skip('This test does not support SQL Server')
+
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    metadata = sqlalchemy.MetaData()
+    table = sqlalchemy.Table(table_name,
+                             metadata,
+                             sqlalchemy.Column('user', sqlalchemy.String(50)),
+                             sqlalchemy.Column('event', sqlalchemy.String(50)))
+    logger.info('Creating table %s in %s database ...', table_name, database.type)
+    table.create(database.engine)
+
+    query = f"INSERT INTO {table_name} VALUES ('${{record:value('/user')}}', '${{record:attribute('sdc.event.type')}}')"
+
+    builder = sdc_builder.get_pipeline_builder()
+    source = builder.add_stage('Dev Raw Data Source')
+    source.stop_after_first_batch = True
+    source.data_format = 'TEXT'
+    source.raw_data='SOMETHING'
+
+    trash = builder.add_stage('Trash')
+
+    start_stage = builder.add_start_event_stage('JDBC Query')
+    if Version(sdc_builder.version) < Version('3.14.0'):
+        start_stage.set_attributes(sql_query=query)
+    else:
+        start_stage.set_attributes(sql_queries=[query])
+
+    stop_stage = builder.add_stop_event_stage('JDBC Query')
+    if Version(sdc_builder.version) < Version('3.14.0'):
+        stop_stage.set_attributes(sql_query=query)
+    else:
+        stop_stage.set_attributes(sql_queries=[query])
+
+    source >> trash
+
+    pipeline = builder.build().configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        sdc_executor.start_pipeline(pipeline).wait_for_finished()
+
+        result = database.engine.execute(table.select())
+        db = sorted(result.fetchall(), key=lambda row: row[1])
+        result.close()
+
+        assert db[0][0] == 'admin'
+        assert db[0][1] == 'pipeline-start'
+        assert db[1][0] == ''
+        assert db[1][1] == 'pipeline-stop'
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
+def test_jdbc_query_executor_failure_state(sdc_builder, sdc_executor, database):
+    """Verify that the executor is properly called with the proper state on pipeline initialization failure."""
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    metadata = sqlalchemy.MetaData()
+    table = sqlalchemy.Table(table_name,
+                             metadata,
+                             sqlalchemy.Column('reason', sqlalchemy.String(50)))
+    logger.info('Creating table %s in %s database ...', table_name, database.type)
+    table.create(database.engine)
+
+    query = f"INSERT INTO {table_name} VALUES ('${{record:value('/reason')}}')"
+
+    builder = sdc_builder.get_pipeline_builder()
+    source = builder.add_stage('JDBC Multitable Consumer')
+    source.table_configs=[{"tablePattern": 'this_table_do_not_exists'}]
+
+    trash = builder.add_stage('Trash')
+
+    stop_stage = builder.add_stop_event_stage('JDBC Query')
+    if Version(sdc_builder.version) < Version('3.14.0'):
+        stop_stage.set_attributes(sql_query=query)
+    else:
+        stop_stage.set_attributes(sql_queries=[query])
+
+    source >> trash
+
+    pipeline = builder.build().configure_for_environment(database)
+    # Injecting failure - this URL won't exists, pipeline won't be able to start properly
+    source.jdbc_connection_string = "jdbc:mysql://this-do-not-exists:3306/awesome-db"
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        sdc_executor.start_pipeline(pipeline, wait=False).wait_for_status('START_ERROR', ignore_errors=True)
+
+        result = database.engine.execute(table.select())
+        db = result.fetchall()
+        result.close()
+
+        assert db[0][0] == 'FAILURE'
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
+@sdc_min_version('3.11.0')
+def test_jdbc_query_executor_select_query_result_count(sdc_builder, sdc_executor, database):
+    """Simple JDBC Query Executor test for successful-query event type and query result count enabled.
+    Pipeline will insert records into database and then using sqlalchemy, the verification will happen
+    that correct data is inserted into database and then the same data is queried. Event records are
+    verified for successful-query event type and query-result field for the select query.
+
+    This is achieved by using a deduplicator which assures us that there is only one ingest to database.
+    The pipeline looks like:
+        dev_raw_data_source >> record_deduplicator >> jdbc_query_executor1 >= jdbc_query_executor2 >= trash1
+                               record_deduplicator >> trash2
+    """
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    table = _create_table(table_name, database)
+
+    DATA = ['id,name'] + [','.join(str(item) for item in rec.values()) for rec in ROWS_IN_DATABASE]
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.set_attributes(data_format='DELIMITED',
+                                       header_line='WITH_HEADER',
+                                       raw_data='\n'.join(DATA))
+
+    query_str1 = f"INSERT INTO {table_name} (name, id) VALUES ('${{record:value('/name')}}', '${{record:value('/id')}}')"
+    query_str2 = f"SELECT * FROM {table_name}"
+
+    jdbc_query_executor1 = pipeline_builder.add_stage('JDBC Query', type='executor')
+    if Version(sdc_builder.version) < Version('3.14.0'):
+        jdbc_query_executor1.set_attributes(sql_query=query_str1)
+    else:
+        jdbc_query_executor1.set_attributes(sql_queries=[query_str1])
+
+    jdbc_query_executor2 = pipeline_builder.add_stage('JDBC Query', type='executor')
+
+    jdbc_query_executor2.set_attributes(include_query_result_count_in_events=True)
+
+    if Version(sdc_builder.version) < Version('3.14.0'):
+        jdbc_query_executor2.set_attributes(sql_query=query_str2)
+    else:
+        jdbc_query_executor2.set_attributes(sql_queries=[query_str2])
+
+    record_deduplicator = pipeline_builder.add_stage('Record Deduplicator')
+    trash1 = pipeline_builder.add_stage('Trash')
+    trash2 = pipeline_builder.add_stage('Trash')
+
+    dev_raw_data_source >> record_deduplicator >> jdbc_query_executor1 >= jdbc_query_executor2 >= trash1
+    record_deduplicator >> trash2
+    pipeline = pipeline_builder.build(title='JDBC Query Executor').configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        event_records = snapshot[jdbc_query_executor2.instance_name].event_records
+        assert len(event_records) == 3
+        assert 'successful-query' == event_records[0].header['values']['sdc.event.type']
+        assert 'successful-query' == event_records[1].header['values']['sdc.event.type']
+        assert 'successful-query' == event_records[2].header['values']['sdc.event.type']
+
+        assert '3 row(s) returned' == event_records[0].value['value']['query-result']['value']
+        assert '3 row(s) returned' == event_records[1].value['value']['query-result']['value']
+        assert '3 row(s) returned' == event_records[2].value['value']['query-result']['value']
+
+        result = database.engine.execute(table.select())
+        result.close()
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
+@sdc_min_version('3.11.0')
+def test_jdbc_query_executor_failed_query_event(sdc_builder, sdc_executor, database):
+    """Simple JDBC Query Executor test for failed-query event type.
+    Pipeline will try to insert records into a non-existing table and the query would fail.
+    Event records are verified for failed-query event type.
+
+    This is achieved by using a deduplicator which assures us that there is only one ingest to database.
+    The pipeline looks like:
+        dev_raw_data_source >> record_deduplicator >> jdbc_query_executor >= trash1
+                               record_deduplicator >> trash2
+    """
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    table = _create_table(table_name, database)
+
+    DATA = ['id,name'] + [','.join(str(item) for item in rec.values()) for rec in ROWS_IN_DATABASE]
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.set_attributes(data_format='DELIMITED',
+                                       header_line='WITH_HEADER',
+                                       raw_data='\n'.join(DATA))
+    invalid_table = "INVALID_TABLE"
+    query_str = f"INSERT INTO {invalid_table} (name, id) VALUES ('${{record:value('/name')}}', '${{record:value('/id')}}')"
+
+    jdbc_query_executor = pipeline_builder.add_stage('JDBC Query', type='executor')
+
+    if Version(sdc_builder.version) < Version('3.14.0'):
+        jdbc_query_executor.set_attributes(sql_query=query_str)
+    else:
+        jdbc_query_executor.set_attributes(sql_queries=[query_str])
+
+    record_deduplicator = pipeline_builder.add_stage('Record Deduplicator')
+    trash1 = pipeline_builder.add_stage('Trash')
+    trash2 = pipeline_builder.add_stage('Trash')
+
+    dev_raw_data_source >> record_deduplicator >> jdbc_query_executor >= trash1
+    record_deduplicator >> trash2
+    pipeline = pipeline_builder.build(title='JDBC Query Executor').configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    try:
+        snapshot = sdc_executor.capture_snapshot(pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        event_records = snapshot[jdbc_query_executor.instance_name].event_records
+        assert len(event_records) == 3
+        assert 'failed-query' == event_records[0].header['values']['sdc.event.type']
+        assert 'failed-query' == event_records[1].header['values']['sdc.event.type']
+        assert 'failed-query' == event_records[2].header['values']['sdc.event.type']
+
+        result = database.engine.execute(table.select())
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
+        result.close()
+        assert data_from_database == []
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
 @sdc_min_version('3.10.0')
 @pytest.mark.parametrize('enable_parallel_execution', [True, False])
 def test_jdbc_query_executor_parallel_query_execution(sdc_builder, sdc_executor, database, enable_parallel_execution):
@@ -667,8 +1092,13 @@ def test_jdbc_query_executor_parallel_query_execution(sdc_builder, sdc_executor,
         dev_raw_data_source >> jdbc_query_executor
     """
 
-    table_name = get_random_string(string.ascii_lowercase, 20)
+
+    table_name = get_random_string(string.ascii_uppercase, 20)
     table = _create_table(table_name, database)
+
+    # Make sure that we properly escape the table name. Ideally we would do escape for all databases, but since we
+    # know that all except postgre are passing, we only escape for Postgre for now.
+    enclosed_table = f'"{table_name}"' if type(database) == PostgreSqlDatabase else table_name
 
     # first, the inserts - they will run in parallel,
     # then all the updates will run sequentially
@@ -676,9 +1106,9 @@ def test_jdbc_query_executor_parallel_query_execution(sdc_builder, sdc_executor,
     # otherwise we've failed.
     statements = []
     for rec in ROWS_IN_DATABASE:
-        statements.extend([f"INSERT INTO {table_name} (name, id) VALUES ('{rec['name']}', {rec['id']})",
-                           f"UPDATE {table_name} SET name = 'bob' WHERE id = {rec['id']}",
-                           f"UPDATE {table_name} SET name = 'Merrick' WHERE id = {rec['id']}"])
+        statements.extend([f"INSERT INTO {enclosed_table} (name, id) VALUES ('{rec['name']}', {rec['id']})",
+                           f"UPDATE {enclosed_table} SET name = 'bob' WHERE id = {rec['id']}",
+                           f"UPDATE {enclosed_table} SET name = 'MERRICK' WHERE id = {rec['id']}"])
     # convert to string - Dev Raw Data Source Data Format tab does not seem
     # to "unroll" the array into newline-terminated records.
     statements = "\n".join(statements)
@@ -688,10 +1118,17 @@ def test_jdbc_query_executor_parallel_query_execution(sdc_builder, sdc_executor,
     dev_raw_data_source.set_attributes(data_format='TEXT', raw_data=statements)
 
     jdbc_query_executor = pipeline_builder.add_stage('JDBC Query', type='executor')
-    jdbc_query_executor.set_attributes(sql_query="${record:value('/text')}",
-                                       enable_parallel_queries=enable_parallel_execution,
+
+    query_str = "${record:value('/text')}"
+
+    jdbc_query_executor.set_attributes(enable_parallel_queries=enable_parallel_execution,
                                        maximum_pool_size=2,
                                        minimum_idle_connections=2)
+
+    if Version(sdc_builder.version) < Version('3.14.0'):
+        jdbc_query_executor.set_attributes(sql_query=query_str)
+    else:
+        jdbc_query_executor.set_attributes(sql_queries=[query_str])
 
     dev_raw_data_source >> jdbc_query_executor
 
@@ -703,9 +1140,9 @@ def test_jdbc_query_executor_parallel_query_execution(sdc_builder, sdc_executor,
         sdc_executor.stop_pipeline(pipeline)
 
         result = database.engine.execute(table.select())
-        data_from_database = sorted(result.fetchall(), key=lambda row: row[1]) # order by id
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
         result.close()
-        assert data_from_database == [('Merrick', record['id']) for record in ROWS_IN_DATABASE]
+        assert data_from_database == [('MERRICK', record['id']) for record in ROWS_IN_DATABASE]
     finally:
         logger.info('Dropping table %s in %s database ...', table_name, database.type)
         table.drop(database.engine)
@@ -765,13 +1202,12 @@ def test_jdbc_producer_insert(sdc_builder, sdc_executor, database):
         table.drop(database.engine)
 
 
-@database
+@database('mysql', 'postgresql')
 def test_jdbc_producer_insert_type_err(sdc_builder, sdc_executor, database):
-    """Simple JDBC Producer test with INSERT operation.
-    The pipeline inserts two correct records into the database and verify that correct data is in the database.
-    The pipeline inserts one wrong type record and verify the error is produced
-    The pipeline should look like:
-        dev_raw_datasource >> jdbc_producer
+    """This test covers invalid type coersion - writing string into int column. As different databases works differently,
+    we can't assert this across all supported databases. MySQL and PostgreSQL behaves the same way and we can properly
+    catch and generate JDBC_23. Other databases report coercion issues much later in the query cycle, sometimes even
+    in a way where we can't understand what and why has happened.
     """
 
     ROWS_IN_DATABASE = [
@@ -1136,6 +1572,9 @@ def test_jdbc_producer_multirow_with_duplicates(sdc_builder, sdc_executor, datab
     """
     Make sure that when using Multi Row insert, data related errors are send to error stream.
     """
+    if type(database) == SQLServerDatabase:
+        pytest.skip('This test is trying to insert explicit value to identity column which is not supported on SQL Server')
+
     table_name = get_random_string(string.ascii_lowercase, 15)
 
     builder = sdc_builder.get_pipeline_builder()
@@ -1760,7 +2199,7 @@ def test_jdbc_producer_oracle_data_errors(sdc_builder, sdc_executor, multi_row, 
     ('date', "TO_DATE('1998-1-1 6:22:33', 'YYYY-MM-DD HH24:MI:SS')", 'DATETIME', 883635753000),
     ('timestamp', "TIMESTAMP'1998-1-2 6:00:00'", 'DATETIME', 883720800000),
     ('timestamp with time zone', "TIMESTAMP'1998-1-3 6:00:00-5:00'", 'ZONED_DATETIME', '1998-01-03T06:00:00-05:00'),
-    ('timestamp with local time zone', "TIMESTAMP'1998-1-4 6:00:00-5:00'", 'ZONED_DATETIME', '1998-01-04T07:00:00Z'),
+    ('timestamp with local time zone', "TIMESTAMP'1998-1-4 6:00:00-5:00'", 'ZONED_DATETIME', '1998-01-04T11:00:00Z'),
     ('long', "'LONG'", 'STRING', 'LONG'),
     ('blob', "utl_raw.cast_to_raw('BLOB')", 'BYTE_ARRAY', 'QkxPQg=='),
     ('clob', "'CLOB'", 'STRING', 'CLOB'),
@@ -1983,7 +2422,7 @@ def test_jdbc_multitable_oracle_split_by_timestamp_with_timezone(sdc_builder, sd
         connection.execute(f"""
             CREATE TABLE {table_name}(
                 ID number primary key,
-                TZ timestamp(6) with time zone 
+                TZ timestamp(6) with time zone
             )
         """)
         # Create destination table
@@ -2009,7 +2448,7 @@ def test_jdbc_multitable_oracle_split_by_timestamp_with_timezone(sdc_builder, sd
         }]
         origin.number_of_threads = 2
         origin.maximum_pool_size = 2
-        origin.max_batch_size_records = 30
+        origin.max_batch_size_in_records = 30
 
         finisher = builder.add_stage('Pipeline Finisher Executor')
         finisher.stage_record_preconditions = ['${record:eventType() == "no-more-data"}']
@@ -2037,6 +2476,115 @@ def test_jdbc_multitable_oracle_split_by_timestamp_with_timezone(sdc_builder, sd
         for m in range(6, 8):
             for s in range(0, 59):
                 connection.execute(f"INSERT INTO {table_name} VALUES({m*100+s}, TIMESTAMP'2019-01-01 10:{m}:{s}-5:00')")
+        connection.execute("commit")
+
+        sdc_executor.start_pipeline(pipeline).wait_for_finished()
+        result = [row.items() for row in connection.execute(comparing_query)]
+        assert len(result) == 0
+
+    finally:
+        logger.info('Dropping table %s and %s in %s database ...', table_name, table_name_dest, database.type)
+        connection.execute(f"DROP TABLE {table_name}")
+        connection.execute(f"DROP TABLE {table_name_dest}")
+
+
+def _get_date_from_days(d):
+    return datetime.date(1970, 1, 1) + datetime.timedelta(days=d)
+
+
+@database('oracle')
+def test_jdbc_multitable_oracle_split_by_date(sdc_builder, sdc_executor, database):
+    """Make sure that we can properly partition DATE type.
+    More precisely, we want to run this pipeline:
+
+    multitable >> jdbc
+    multitable >= finisher
+
+    With more than one thread and using a DATE column as a offset column.
+    This feature was not available until version 3.11.0, and was detected and
+    solved in ESC-513.
+    """
+    table_name = get_random_string(string.ascii_uppercase, 20)
+    table_name_dest = get_random_string(string.ascii_uppercase, 20)
+
+    connection = database.engine.connect()
+
+    comparing_query = f"""(
+        select * from {table_name}
+        minus
+        select * from {table_name_dest}
+    ) union (
+        select * from {table_name_dest}
+        minus
+        select * from {table_name}
+    )"""
+
+    try:
+        # Create table
+        connection.execute(f"""
+            CREATE TABLE {table_name}(
+                ID number primary key,
+                DT date
+            )
+        """)
+        # Create destination table
+        connection.execute(f"""CREATE TABLE {table_name_dest} AS SELECT * FROM {table_name} WHERE 1=0""")
+
+        # Insert a few rows
+        for m in range(0, 5):
+            for s in range(0, 59):
+                identifier = 100 * m + s
+                connection.execute(
+                    f"INSERT INTO {table_name} VALUES({identifier}, DATE'{_get_date_from_days(identifier)}')"
+                )
+        connection.execute("commit")
+
+        builder = sdc_builder.get_pipeline_builder()
+
+        origin = builder.add_stage('JDBC Multitable Consumer')
+        # Partition size is set to 259200000 which corresponds to 30 days in ms,
+        # since dates are translated to timestamps
+        origin.table_configs = [{
+            "tablePattern": f'%{table_name}%',
+            "overrideDefaultOffsetColumns": True,
+            "offsetColumns": ["DT"], # Should cause SDC < 3.11.0 to throw an UnsupportedOperationException
+            "enableNonIncremental": False,
+            "partitioningMode": "REQUIRED",
+            "partitionSize": "259200000", # 30 days = 30*24*60*60*1000 (259200000)ms
+            "maxNumActivePartitions": 2
+        }]
+        origin.number_of_threads = 2
+        origin.maximum_pool_size = 2
+
+        finisher = builder.add_stage('Pipeline Finisher Executor')
+        finisher.stage_record_preconditions = ['${record:eventType() == "no-more-data"}']
+
+        FIELD_MAPPINGS = [dict(field='/ID', columnName='ID'),
+                          dict(field='/DT', columnName='DT')]
+        destination = builder.add_stage('JDBC Producer')
+        destination.set_attributes(default_operation='INSERT',
+                                   table_name=table_name_dest,
+                                   field_to_column_mapping=FIELD_MAPPINGS,
+                                   stage_on_record_error='STOP_PIPELINE')
+
+        origin >> destination
+        origin >= finisher
+
+        pipeline = builder.build().configure_for_environment(database)
+        sdc_executor.add_pipeline(pipeline)
+
+        sdc_executor.start_pipeline(pipeline).wait_for_finished()
+
+        result = [row.items() for row in connection.execute(comparing_query)]
+        assert len(result) == 0
+
+        # Insert few more rows and validate the outcome again
+        for m in range(6, 8):
+            for s in range(0, 59):
+                identifier = 100 * m + s
+                connection.execute(
+                    f"INSERT INTO {table_name} VALUES({identifier}, DATE'{_get_date_from_days(identifier)}')"
+                )
         connection.execute("commit")
 
         sdc_executor.start_pipeline(pipeline).wait_for_finished()
@@ -2120,6 +2668,7 @@ def test_jdbc_multitable_consumer_origin_high_resolution_timestamp_offset(sdc_bu
 
 
 @database
+@sdc_min_version('3.0.0.0')
 def test_jdbc_multitable_consumer_partitioned_large_offset_gaps(sdc_builder, sdc_executor, database):
     """
     Ensure that the multi-table JDBC origin can handle large gaps between offset columns in partitioned mode
@@ -2368,7 +2917,7 @@ def test_jdbc_postgresql_types(sdc_builder, sdc_executor, database, use_table_or
               END IF;
             END;
             $$
-            LANGUAGE plpgsql;        
+            LANGUAGE plpgsql;
         """)
 
         # Create enum complex type conditionally
@@ -2383,7 +2932,7 @@ def test_jdbc_postgresql_types(sdc_builder, sdc_executor, database, use_table_or
               END IF;
             END;
             $$
-            LANGUAGE plpgsql;        
+            LANGUAGE plpgsql;
         """)
 
         # Create table
@@ -2448,7 +2997,7 @@ def test_jdbc_postgresql_types(sdc_builder, sdc_executor, database, use_table_or
     ('DATE', "'2019-01-01'", 'DATE', 1546300800000),
     ('DATETIME', "'2004-05-23T14:25:10'", 'DATETIME', 1085322310000),
     ('DATETIME2', "'2004-05-23T14:25:10'", 'DATETIME', 1085322310000),
-    ('DATETIMEOFFSET', "'2004-05-23T14:25:10'", 'STRING', '2004-05-23 14:25:10 +00:00'),
+    ('DATETIMEOFFSET', "'2004-05-23 14:25:10.3456 -08:00'", 'DEPENDS_ON_VERSION', 'depends_on_version'),
     ('SMALLDATETIME', "'2004-05-23T14:25:10'", 'DATETIME', 1085322300000),
     ('TIME', "'14:25:10'", 'TIME', 51910000),
     ('BIT', "1", 'BOOLEAN', True),
@@ -2500,14 +3049,23 @@ def test_jdbc_sqlserver_types(sdc_builder, sdc_executor, database, use_table_ori
         if use_table_origin:
             origin = builder.add_stage('JDBC Multitable Consumer')
             origin.table_configs = [{"tablePattern": f'%{table_name}%'}]
-            origin.on_unknown_type = 'CONVERT_TO_STRING'
         else:
             origin = builder.add_stage('JDBC Query Consumer')
             origin.sql_query = 'SELECT * FROM {0}'.format(table_name)
             origin.incremental_mode = False
-            origin.on_unknown_type = 'CONVERT_TO_STRING'
 
         trash = builder.add_stage('Trash')
+
+        # As a part of SDC-10125, DATETIMEOFFSET is natively supported in SDC, and is converted into ZONED_DATETIME
+        if sql_type == 'DATETIMEOFFSET':
+            if Version(sdc_builder.version) >= Version('3.14.0'):
+                expected_type = 'ZONED_DATETIME'
+                expected_value = '2004-05-23T14:25:10.3456-08:00'
+            else:
+                expected_type = 'STRING'
+                expected_value = '2004-05-23 14:25:10.3456 -08:00'
+                # This unknown_type_action setting is required, otherwise DATETIMEOFFSET tests for SDC < 3.14 will fail.
+                origin.on_unknown_type = 'CONVERT_TO_STRING'
 
         origin >> trash
 
@@ -2533,3 +3091,445 @@ def test_jdbc_sqlserver_types(sdc_builder, sdc_executor, database, use_table_ori
     finally:
         logger.info('Dropping table %s in %s database ...', table_name, database.type)
         connection.execute(f"DROP TABLE {table_name}")
+
+
+@sdc_min_version('3.12.0')
+@database('sqlserver')
+@pytest.mark.parametrize('on_unknown_type_action', ['CONVERT_TO_STRING', 'STOP_PIPELINE'])
+def test_jdbc_sqlserver_on_unknown_type_action(sdc_builder, sdc_executor, database, on_unknown_type_action):
+    """Test JDBC Multitable Consumer with MS-SQL server for the on_unknown_type action.
+        This is to verify SDC-12764.
+        When the 'On Unknown Type' action is set to STOP_PIPELINE,the pipeline should stop with a StageException Error since it cannot convert DATETIMEOFFSET field
+        When the 'On Unknown Type' action is set to CONVERT_TO_STRING, the pipeline should convert the unknown type to string and process next record
+        The pipeline will look like:
+            JDBC_Multitable_Consumer >> trash
+    """
+
+    if Version(sdc_builder.version) >= Version('3.14.0'):
+        pytest.skip("Skipping SQLServer Unknown Type action check, since DATETIMEOFFSET field is now natively supported from SDC Version 3.14.0")
+
+    column_type = 'DATETIMEOFFSET'
+    INPUT_DATE = "'2004-05-23T14:25:10'"
+    EXPECTED_OUTCOME = OrderedDict(id=1, date_offset='2004-05-23 14:25:10 +00:00')
+
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    connection = database.engine.connect()
+
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+
+    # Setup Origin with specified unknown type action
+    jdbc_multitable_consumer = pipeline_builder.add_stage('JDBC Multitable Consumer')
+    jdbc_multitable_consumer.set_attributes(table_configs=[{"tablePattern": f'%{table_name}%'}],
+                                            on_unknown_type=on_unknown_type_action)
+
+    # Setup destination
+    trash=pipeline_builder.add_stage('Trash')
+
+    # Connect the pipeline stages
+    jdbc_multitable_consumer >> trash
+
+    pipeline = pipeline_builder.build().configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    # Create table and add a row
+    connection.execute(f"""
+        CREATE TABLE {table_name}(
+            id int primary key,
+            date_offset {column_type} NOT NULL
+        )
+    """)
+    connection.execute(f"INSERT INTO {table_name} VALUES(1, {INPUT_DATE})")
+
+    try:
+        if on_unknown_type_action == 'STOP_PIPELINE':
+            # Pipeline should stop with StageException
+            with pytest.raises(Exception):
+                sdc_executor.start_pipeline(pipeline)
+                sdc_executor.stop_pipeline(pipeline)
+
+            status = sdc_executor.get_pipeline_status(pipeline).response.json().get('status')
+            assert 'RUN_ERROR' == status
+        else:
+            snapshot = sdc_executor.capture_snapshot(pipeline=pipeline, start_pipeline=True).snapshot
+            output_records = snapshot[jdbc_multitable_consumer].output
+
+            assert len(output_records) == 1
+            assert output_records[0].field == EXPECTED_OUTCOME
+
+    finally:
+        status = sdc_executor.get_pipeline_status(pipeline).response.json().get('status')
+        if status == 'RUNNING':
+            sdc_executor.stop_pipeline(pipeline)
+
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        connection.execute(f"DROP TABLE {table_name}")
+
+
+@sdc_min_version('3.14.0')
+@database('sqlserver')
+def test_jdbc_sqlserver_datetimeoffset_as_primary_key(sdc_builder, sdc_executor, database):
+    """Test JDBC Multitable Consumer with SQLServer table configured with DATETIMEOFFSET column as primary key.
+        The pipeline will look like:
+            JDBC_Multitable_Consumer >> trash
+    """
+    INPUT_COLUMN_TYPE, INPUT_DATE = 'DATETIMEOFFSET', "'2004-05-23 14:25:10.3456 -08:00'"
+    EXPECTED_TYPE, EXPECTED_VALUE = 'ZONED_DATETIME', '2004-05-23T14:25:10.3456-08:00'
+
+    table_name = get_random_string(string.ascii_lowercase, 20)
+    connection = database.engine.connect()
+
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+
+    jdbc_multitable_consumer = pipeline_builder.add_stage('JDBC Multitable Consumer')
+    jdbc_multitable_consumer.set_attributes(table_configs=[{"tablePattern": f'%{table_name}%'}])
+
+    trash=pipeline_builder.add_stage('Trash')
+
+    jdbc_multitable_consumer >> trash
+
+    pipeline = pipeline_builder.build().configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    connection.execute(f"""
+        CREATE TABLE {table_name}(
+            dto {INPUT_COLUMN_TYPE} NOT NULL PRIMARY KEY
+        )
+    """)
+    connection.execute(f"INSERT INTO {table_name} VALUES({INPUT_DATE})")
+
+    try:
+        snapshot = sdc_executor.capture_snapshot(pipeline=pipeline, start_pipeline=True).snapshot
+        sdc_executor.stop_pipeline(pipeline)
+
+        assert len(snapshot[jdbc_multitable_consumer].output) == 1
+        record = snapshot[jdbc_multitable_consumer].output[0]
+
+        assert record.field['dto'].type == EXPECTED_TYPE
+        assert record.field['dto'].value == EXPECTED_VALUE
+
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        connection.execute(f"DROP TABLE {table_name}")
+
+
+# Test for SDC-13288
+@database('db2')
+def test_jdbc_producer_db2_long_record(sdc_builder, sdc_executor, database):
+    """Test that JDBC Producer correctly sends record when setting Custom Data SQLSTATE for db2 database instead of
+     throwing StageException. The pipelines reads a file with 5 records 1 by 1 having the last record being biggest
+     than the db2 table column size. That throws an error with an specific SQL Code (22001). Having that code in Custom
+     Data SQLSTATE sends the last record to error.
+
+     The pipeline looks like:
+
+     directory_origin >> jdbc_producer
+
+     In order to create the file read by directory origin another pipeline is used that looks like:
+
+     dev_raw_data_source >> local_fs
+    """
+
+    # Insert data into file.
+    tmp_directory = os.path.join(tempfile.gettempdir(), get_random_string(string.ascii_letters, 10))
+    csv_records = ['1,hello', '2,hello', '3,hello', '4,hello', '5,hellolargerword']
+    _setup_delimited_file(sdc_executor, tmp_directory, csv_records)
+
+    # Create directory origin.
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+    directory = pipeline_builder.add_stage('Directory', type='origin')
+    directory.set_attributes(data_format='DELIMITED',
+                             file_name_pattern='sdc*', file_name_pattern_mode='GLOB',
+                             file_post_processing='DELETE', files_directory=tmp_directory,
+                             batch_size_in_recs=1)
+
+    # Create jdbc producer destination.
+    # Create table. db2 internal sets table name in uppercase. Thus using directly ascii uppercase.
+    table_name = get_random_string(string.ascii_uppercase, 20)
+    database.engine.execute(f'CREATE TABLE {table_name} (id VARCHAR(20) NOT NULL PRIMARY KEY, a VARCHAR(10));')
+    field_to_column_mapping = [dict(columnName='ID',
+                                    dataType='USE_COLUMN_TYPE',
+                                    field='/0',
+                                    paramValue='?'),
+                               dict(columnName='A',
+                                    dataType='USE_COLUMN_TYPE',
+                                    field='/1',
+                                    paramValue='?')]
+    jdbc_producer = pipeline_builder.add_stage('JDBC Producer')
+    jdbc_producer.set_attributes(default_operation="INSERT",
+                                 schema_name=DEFAULT_DB2_SCHEMA,
+                                 table_name=table_name,
+                                 field_to_column_mapping=field_to_column_mapping,
+                                 stage_on_record_error='TO_ERROR',
+                                 data_sqlstate_codes=["22001"])
+
+    directory >> jdbc_producer
+
+    directory_jdbc_producer_pipeline = pipeline_builder.build(
+        title='Directory - JDBC Producer. Test DB2 sql code error').configure_for_environment(database)
+    sdc_executor.add_pipeline(directory_jdbc_producer_pipeline)
+
+    try:
+        snapshot = sdc_executor.capture_snapshot(directory_jdbc_producer_pipeline, start_pipeline=True, batch_size=1,
+                                                 batches=5).snapshot
+        sdc_executor.stop_pipeline(directory_jdbc_producer_pipeline)
+
+        assert 5 == len(snapshot.snapshot_batches)
+
+        result = database.engine.execute(f'SELECT ID,A FROM {table_name};')
+        data_from_database = sorted(result.fetchall(), key=lambda row: row[1])  # Order by id.
+        result.close()
+
+        # Assert records in database include from id=1 to id=4 excluding id=5. Columns => record[0] = id, record[1] = a.
+        assert data_from_database == [(record[0], record[1]) for record in
+                                      [unified_record.split(',') for unified_record in csv_records[:-1]]]
+
+        stage = snapshot.snapshot_batches[4][jdbc_producer.instance_name]
+
+        assert 1 == len(stage.error_records)
+
+        error_record = stage.error_records[0]
+
+        assert 'hellolargerword' == error_record.field['1']
+        assert 'JDBC_14' == error_record.header['errorCode']
+        assert 'SQLSTATE=22001' in error_record.header['errorMessage']
+
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        database.engine.execute(f'DROP TABLE {table_name}')
+
+
+def _setup_delimited_file(sdc_executor, tmp_directory, csv_records):
+    """Setup csv records and save in local system. The pipelines looks like:
+
+            dev_raw_data_source >> local_fs
+
+    """
+    raw_data = "\n".join(csv_records)
+    pipeline_builder = sdc_executor.get_pipeline_builder()
+    dev_raw_data_source = pipeline_builder.add_stage('Dev Raw Data Source')
+    dev_raw_data_source.set_attributes(data_format='TEXT', raw_data=raw_data, stop_after_first_batch=True)
+    local_fs = pipeline_builder.add_stage('Local FS', type='destination')
+    local_fs.set_attributes(data_format='TEXT',
+                            directory_template=tmp_directory,
+                            files_prefix='sdc-${sdc:id()}', files_suffix='csv')
+
+    dev_raw_data_source >> local_fs
+    files_pipeline = pipeline_builder.build('Generate files pipeline')
+    sdc_executor.add_pipeline(files_pipeline)
+
+    # Generate some batches/files.
+    sdc_executor.start_pipeline(files_pipeline).wait_for_finished(timeout_sec=5)
+
+    return csv_records
+
+
+# SDC-13556: Do not spin JDBC Destination and Tee Processor machinery for empty batches
+@sdc_min_version('3.14.0')
+@database('mysql')
+@pytest.mark.parametrize('use_multi_row', [True, False])
+def test_jdbc_tee_commits_on_empty_batches(use_multi_row, sdc_builder, sdc_executor, database):
+    """Ensure that the JDBC Tee processor won't generate commits on empty batches. Since it's generally difficult
+    to create empty batches in SDC, we use scripting origin to generate them and then check commit timer (which also
+    contains count) to ensure that we don't generate excessive commits on the database."""
+    builder = sdc_builder.get_pipeline_builder()
+    table_name = get_random_string(string.ascii_lowercase, 20)
+
+    script = """
+// First batch contains exactly one record
+var batch = sdc.createBatch();
+var record = sdc.createRecord('generated data');
+record.value = {'name': 'A'};
+batch.add(record);
+batch.process("batch", "non-empty");
+
+// Sent 1000 batches that will be empty
+var step;
+for (step = 0; step < 1000; step++) {
+  batch = sdc.createBatch();
+  batch.process("whatever", "batch-" + step);
+}
+"""
+
+    origin = builder.add_stage('JavaScript Scripting')
+    origin.record_type='NATIVE_OBJECTS'
+    origin.user_script=script
+
+    tee = builder.add_stage('JDBC Tee')
+    tee.default_operation = 'INSERT'
+    tee.field_to_column_mapping = [dict(columnName='name', field='/name', paramValue='?')]
+    tee.generated_column_mappings = [dict(columnName='id', field='/id')]
+    tee.table_name = table_name
+    tee.use_multi_row_operation = use_multi_row
+
+    trash = builder.add_stage('Trash')
+
+    origin >> tee >> trash
+
+    pipeline = builder.build().configure_for_environment(database)
+    sdc_executor.add_pipeline(pipeline)
+
+    table = _create_table(table_name, database)
+    try:
+        sdc_executor.start_pipeline(pipeline).wait_for_finished()
+
+        # First of all, verify that the table have exactly one record with expected values
+        result = database.engine.execute(table.select())
+        db = sorted(result.fetchall(), key=lambda row: row[1])  # order by id
+        result.close()
+        assert len(db) == 1
+        assert db[0][0] == 'A'
+        assert db[0][1] == 1
+
+        # Second of all, we should see exactly 1001 batches generated by our scripting origin
+        history = sdc_executor.get_pipeline_history(pipeline)
+        assert history.latest.metrics.counter('pipeline.batchCount.counter').count == 1001
+
+        # Then let's explore how many commits have we generated to ensure that we don't have 1001 commits
+        expected_commits = 1 if use_multi_row else 2
+        assert history.latest.metrics.timer('custom.JDBCTee_01.Commit Timer.0.timer').count == expected_commits
+    finally:
+        logger.info('Dropping table %s in %s database ...', table_name, database.type)
+        table.drop(database.engine)
+
+
+@database
+@sdc_min_version('3.15.0')
+def test_multitable_quote_column_names(sdc_builder, sdc_executor, database):
+    """
+    Ensure that we properly quote all table and column names when querying the database.
+    """
+    table_name = "table_" + get_random_string(string.ascii_letters, 10)
+    offset_name = "column_" + get_random_string(string.ascii_letters, 10)
+
+    builder = sdc_builder.get_pipeline_builder()
+
+    origin = builder.add_stage('JDBC Multitable Consumer')
+    origin.table_configs=[{"tablePattern": f'%{table_name}%'}]
+    origin.max_batch_size_in_records = 10
+
+    trash = builder.add_stage('Trash')
+
+    origin >> trash
+
+    pipeline = builder.build().configure_for_environment(database)
+    # Work-arounding STF behavior of upper-casing table name configuration
+    origin.table_configs[0]["tablePattern"] = f'%{table_name}%'
+
+    metadata = sqlalchemy.MetaData()
+    table = sqlalchemy.Table(
+        table_name,
+        metadata,
+        sqlalchemy.Column(offset_name, sqlalchemy.Integer, primary_key=True, quote=True),
+        quote = True
+    )
+    try:
+        logger.info('Creating table %s in %s database ...', table_name, database.type)
+        table.create(database.engine)
+
+        logger.info('Adding three rows into %s database ...', database.type)
+        connection = database.engine.connect()
+        connection.execute(table.insert(), [{offset_name: 1}])
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline=pipeline, start_pipeline=True).snapshot
+        # We want to run for a few seconds to see if any errors show up (like that did in previous versions)
+        time.sleep(10)
+        sdc_executor.stop_pipeline(pipeline)
+
+        # There should be no errors reported
+        history = sdc_executor.get_pipeline_history(pipeline)
+        assert history.latest.metrics.counter('stage.JDBCMultitableConsumer_01.errorRecords.counter').count == 0
+        assert history.latest.metrics.counter('stage.JDBCMultitableConsumer_01.stageErrors.counter').count == 0
+
+        # And verify that we properly read that one record
+        assert len(snapshot[origin].output) == 1
+        assert snapshot[origin].output[0].get_field_data('/' + offset_name) == 1
+    finally:
+        logger.info('Dropping table %s in %s database...', table_name, database.type)
+        table.drop(database.engine)
+
+@database
+@sdc_min_version('3.0.0.0')
+def test_jdbc_multitable_consumer_duplicates_read_when_initial_offset_configured(sdc_builder, sdc_executor, database):
+    """
+    SDC-13625 Integration test for SDC-13624 - MT Consumer ingests duplicates when initial offset is specified
+    Setup origin as follows:
+        partitioning enabled + num_threads and num partitions > 1 + override offset column set
+        + initial value specified for offset
+
+    Verify that origin does not ingest the records more than once (duplicates) when initial value for offset is set
+
+    Pipeline:
+        JDBC MT Consumer >> Trash
+                         >= Pipeline Finisher (no-more-data)
+    """
+    if database.type == 'Oracle':
+        pytest.skip("This test depends on proper case for column names that Oracle auto-uppers.")
+
+    src_table_prefix = get_random_string(string.ascii_lowercase, 6)
+    table_name = '{}_{}'.format(src_table_prefix, get_random_string(string.ascii_lowercase, 20))
+
+    pipeline_builder = sdc_builder.get_pipeline_builder()
+
+    jdbc_multitable_consumer = pipeline_builder.add_stage('JDBC Multitable Consumer')
+    jdbc_multitable_consumer.set_attributes(table_configs=[{
+        "tablePattern": f'{table_name}',
+        "enableNonIncremental": False,
+        "partitioningMode": "REQUIRED",
+        "partitionSize": "100000",
+        "maxNumActivePartitions": 5,
+        'overrideDefaultOffsetColumns': True,
+        'offsetColumns': ['created'],
+        'offsetColumnToInitialOffsetValue': [{
+            'key': 'created',
+            'value': '0'
+        }]
+    }])
+
+    jdbc_multitable_consumer.number_of_threads = 2
+    jdbc_multitable_consumer.maximum_pool_size = 2
+
+    trash = pipeline_builder.add_stage('Trash')
+    jdbc_multitable_consumer >> trash
+
+    finisher = pipeline_builder.add_stage("Pipeline Finisher Executor")
+    finisher.stage_record_preconditions = ['${record:eventType() == "no-more-data"}']
+    jdbc_multitable_consumer >= finisher
+
+    pipeline = pipeline_builder.build().configure_for_environment(database)
+    ONE_MILLION = 1000000
+    rows_in_table = [{'id': i, 'name': get_random_string(string.ascii_lowercase, 5), 'created': i + ONE_MILLION}
+                     for i in range(1, 21)]
+
+    metadata = sqlalchemy.MetaData()
+    table = sqlalchemy.Table(
+        table_name,
+        metadata,
+        sqlalchemy.Column('id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('name', sqlalchemy.String(5)),
+        sqlalchemy.Column('created', sqlalchemy.Integer)
+    )
+    try:
+        logger.info('Creating table %s in %s database ...', table_name, database.type)
+        table.create(database.engine)
+
+        logger.info('Adding 20 rows into %s table', table_name)
+        connection = database.engine.connect()
+
+        connection.execute(table.insert(), rows_in_table)
+        connection.close()
+
+        sdc_executor.add_pipeline(pipeline)
+        snapshot = sdc_executor.capture_snapshot(pipeline=pipeline, batches=2, start_pipeline=True).snapshot
+
+        rows_from_snapshot = [(record.get_field_data('/name').value,
+                               record.get_field_data('/id').value,
+                               record.get_field_data('/created').value)
+                              for batch in snapshot.snapshot_batches
+                              for record in batch.stage_outputs[jdbc_multitable_consumer.instance_name].output]
+
+        expected_data = [(row['name'], row['id'], row['created']) for row in rows_in_table]
+        assert rows_from_snapshot == expected_data
+    finally:
+        logger.info('Dropping table %s in %s database...', table_name, database.type)
+        table.drop(database.engine)
